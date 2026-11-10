@@ -1,9 +1,9 @@
 from setuptools import setup, find_packages
 
 setup(
-    name='quantax',
+    name='MinSR',
     version='0.0.1',
-    description='Flexible neural quantum states based on QuSpin, JAX, and Equinox',
+    description='MinSR: efficient optimization of deep neural quantum states',
     author='Ao Chen',
     author_email='chenao.phys@gmail.com',
     packages=find_packages(),
