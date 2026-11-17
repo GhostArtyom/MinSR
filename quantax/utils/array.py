@@ -5,7 +5,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from jax.lax import with_sharding_constraint
-from jax.sharding import SingleDeviceSharding, PositionalSharding
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSharding
 
 
 def is_sharded_array(array: Any) -> bool:
@@ -17,17 +17,17 @@ def is_sharded_array(array: Any) -> bool:
 
 @partial(jax.jit, static_argnums=1)
 def to_array_shard(array: Sequence, sharded_axis: int = 0) -> jax.Array:
-    sharding = PositionalSharding(jax.local_devices())
+    mesh = Mesh(np.array(jax.local_devices()), ("devices",))
     array = jnp.asarray(array)
-    shape = [1] * array.ndim
-    shape[sharded_axis] = sharding.shape[0]
-    array = with_sharding_constraint(array, sharding.reshape(shape))
+    axes = [None] * array.ndim
+    axes[sharded_axis] = "devices"
+    array = with_sharding_constraint(array, NamedSharding(mesh, P(*axes)))
     return array
 
 
 @jax.jit
 def to_array_replicate(array: Sequence) -> jax.Array:
-    sharding = PositionalSharding(jax.local_devices()).replicate()
+    sharding = NamedSharding(Mesh(np.array(jax.local_devices()), ("devices",)), P())
     array = jnp.asarray(array)
     array = with_sharding_constraint(array, sharding)
     return array

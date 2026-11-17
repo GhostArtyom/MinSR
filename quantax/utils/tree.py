@@ -5,7 +5,8 @@ import jax.tree_util as jtu
 import jax.flatten_util as jfu
 import jax.tree_util as jtu
 from jax.lax import with_sharding_constraint
-from jax.sharding import PositionalSharding
+import numpy as np
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import equinox as eqx
 
 
@@ -15,21 +16,20 @@ def tree_fully_flatten(tree: PyTree) -> jax.Array:
 
 
 def filter_shard(tree: PyTree) -> PyTree:
-    sharding = PositionalSharding(jax.local_devices())
-    count = sharding.shape[0]
+    mesh = Mesh(np.array(jax.local_devices()), ("devices",))
     vals, tree_def = jtu.tree_flatten(tree)
     new_vals = []
     for v in vals:
         if eqx.is_array(v):
-            shape = (count,) + (1,) * (v.ndim - 1)
-            new_vals.append(with_sharding_constraint(v, sharding.reshape(shape)))
+            spec = P("devices") if v.ndim else P()
+            new_vals.append(with_sharding_constraint(v, NamedSharding(mesh, spec)))
         else:
             new_vals.append(v)
     return jtu.tree_unflatten(tree_def, new_vals)
 
 
 def filter_replicate(tree: PyTree) -> PyTree:
-    sharding = PositionalSharding(jax.local_devices()).replicate()
+    sharding = NamedSharding(Mesh(np.array(jax.local_devices()), ("devices",)), P())
     dynamic, static = eqx.partition(tree, eqx.is_array)
     dynamic = with_sharding_constraint(dynamic, sharding)
     return eqx.combine(dynamic, static)

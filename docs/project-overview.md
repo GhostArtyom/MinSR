@@ -140,4 +140,4 @@ JAX 负责自动微分、编译和设备计算，Equinox 负责网络模块和�
 
 晶格和部分对称性对象依赖全局状态并带有缓存。切换到另一教程、另一晶格尺寸或另一数值类型配置时，重启 Notebook 内核再执行。`max_parallel` 限制每台设备的前向批量，对称投影会占用该批量；它不直接限制所有导数和求解矩阵的内存。降低它可以缓解部分内存压力，样本数和网络规模也需配合调整。
 
-环境安装沿用根目录的 [安装说明](../README.md#installation)：当前依赖配置面向 Linux x86_64、Python 3.9 和 JAX 0.4.25，并引用相邻目录构建的历史 QuSpin wheel。硬件适配、CPU 执行和 CUDA 检查都已在该说明中列出。
+环境安装沿用根目录的 [安装说明](../README.md#installation)：两台运行 WSL 3.x 的 Fedora 机器分别使用 `environments/py39-jax0425/`（Python 3.9 / JAX 0.4.25）和 `environments/py311-jax062/`（Python 3.11 / JAX 0.6.2）中的配置和锁文件。运行 `python scripts/uv_machine.py sync --locked` 自动按显卡选择配置，环境统一位于根目录 `.venv/`。QuSpin wheel 需按 Python ABI 和目标系统分别构建；当前历史 QuSpin 构建不支持直接换成 Python 3.12。

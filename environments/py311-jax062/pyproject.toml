@@ -3,26 +3,27 @@ requires = ["setuptools==68.2.2", "wheel==0.41.2"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "MinSR"
+name = "minsr-py311-jax062"
 version = "0.0.1"
 description = "MinSR: efficient optimization of deep neural quantum states"
 authors = [{ name = "Ao Chen", email = "chenao.phys@gmail.com" }]
-requires-python = ">=3.9,<3.10"
+requires-python = ">=3.11,<3.12"
 dependencies = [
     "dill==0.3.7",
-    "equinox==0.11.4",
+    "equinox==0.12.2",
     "gmpy2>=2.3.2",
     "ipykernel>=6.31.0",
-    "jax[cuda12-pip]==0.4.25",
-    "jaxtyping==0.2.28",
+    "jax[cuda12]==0.6.2",
+    "jaxtyping==0.3.2",
     "joblib==1.2.0",
     "matplotlib==3.8.3",
     "numba==0.59.0",
     "numexpr==2.8.7",
     "numpy==1.26.3",
-    "nvidia-cudnn-cu12>=8.9.7.29,<9",
+    "nvidia-cuda-nvcc-cu12>=12.8,<13",
+    "nvidia-cudnn-cu12>=9.8,<10",
     "quspin",
-    "scipy==1.11.4",
+    "scipy==1.13.1",
     "six>=1.17.0",
 ]
 
@@ -30,6 +31,7 @@ dependencies = [
 build = ["setuptools==68.2.2", "wheel==0.41.2", "cython==0.29.36"]
 
 [tool.setuptools.packages.find]
+where = ["../.."]
 include = ["quantax*"]
 
 [[tool.uv.index]]
@@ -37,8 +39,7 @@ url = "https://pypi.org/simple"
 default = true
 
 [tool.uv.sources]
-quspin = { path = "../QuSpin/dist/quspin-0.3.7-cp39-cp39-linux_x86_64.whl" }
+quspin = { path = "../../../QuSpin/dist/quspin-0.3.7-cp311-cp311-linux_x86_64.whl" }
 
 [tool.uv]
-find-links = ["https://storage.googleapis.com/jax-releases/jax_cuda_releases.html"]
 environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
