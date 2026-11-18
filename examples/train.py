@@ -2,7 +2,6 @@ import os
 from pathlib import Path
 from time import perf_counter
 
-# Allocate GPU memory on demand and leave room for the desktop and CUDA workspaces.
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.8")
 
@@ -13,18 +12,17 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import quantax as qtx
 from quantax.symmetry import TotalSz
-from quantax.utils import create_run, close_run, log_progress, setup_plot_font, save_training_plots
+from quantax.utils import (
+    create_run, close_run, log_devices, log_progress, setup_plot_font, save_training_plots,
+)
 
 L = 10
 J1, J2 = 1.0, 0.5
-DEPTH = 16  # Positive even number of convolution layers.
-CHANNELS = 16
-KERNEL_SIZE = 3
-USE_SINH = True
+DEPTH, CHANNELS, KERNEL_SIZE, USE_SINH = 16, 16, 3, True
 NSAMPLES = 1000  # 10000
 STEPS = 2000  # 20000
 STEP_SIZE = 1e-3
-MAX_PARALLEL = 1024  # 32768
+MAX_PARALLEL = 32768
 OUTPUT_DIR = Path(__file__).resolve().parents[1] / "runs"
 
 
@@ -39,7 +37,7 @@ def main():
         logger.info(f"Steps={STEPS}; samples={NSAMPLES}; max_parallel={MAX_PARALLEL}; step_size={STEP_SIZE}; reweight=1.0")
         logger.info(f"Network: ResSum(depth={DEPTH}, channels={CHANNELS}, kernel_size={KERNEL_SIZE}, use_sinh={USE_SINH})")
         logger.info(f"Symmetry: TotalSz(0)")
-        logger.info(f"Devices: {jax.devices()}")
+        log_devices(logger, jax.devices())
         setup_plot_font()
 
         lattice = qtx.sites.Square(L)

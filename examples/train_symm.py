@@ -15,20 +15,19 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import quantax as qtx
 from quantax.symmetry import TotalSz, SpinInverse, C4v
-from quantax.utils import create_run, close_run, log_progress, setup_plot_font, save_training_plots
+from quantax.utils import (
+    create_run, close_run, log_devices, log_progress, setup_plot_font, save_training_plots,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 L = 10
 J1, J2 = 1.0, 0.5
-DEPTH = 16  # Network settings must match the input weights.
-CHANNELS = 16
-KERNEL_SIZE = 3
-USE_SINH = True
+DEPTH, CHANNELS, KERNEL_SIZE, USE_SINH = 16, 16, 3, True
 PARAM_FILE = None  # "params_20000.eqx"
-NSAMPLES = 10000
-STEPS = 10000
+NSAMPLES = 1000  # 10000
+STEPS = 1000  # 10000
 STEP_SIZE = 1e-3
-MAX_PARALLEL = 1024  # 32768
+MAX_PARALLEL = 32768
 OUTPUT_DIR = ROOT / "runs"
 
 
@@ -44,14 +43,14 @@ def main(param_file=None):
     run_dir, logger, handler = create_run(OUTPUT_DIR, system_name, "minsr.train_symm")
     try:
         logger.info(f"Run directory: {run_dir}")
+        logger.info(f"Input weights: {param_file}")
         logger.info(f"System: {system_name}; periodic boundaries; total Sz=0")
         logger.info(f"Steps={STEPS}; samples={NSAMPLES}; max_parallel={MAX_PARALLEL}; step_size={STEP_SIZE}; reweight=1.0")
         logger.info(f"Network: ResSum(depth={DEPTH}, channels={CHANNELS}, kernel_size={KERNEL_SIZE}, use_sinh={USE_SINH})")
         logger.info(f"Symmetry: TotalSz(0) + SpinInverse() + C4v()")
-        logger.info(f"Input weights: {param_file}")
         if STEPS < 1 or NSAMPLES < 1 or MAX_PARALLEL < 16:
             raise ValueError("Require STEPS >= 1, NSAMPLES >= 1 and MAX_PARALLEL >= 16 for this symmetry.")
-        logger.info(f"Devices: {jax.devices()}")
+        log_devices(logger, jax.devices())
         setup_plot_font()
         qtx.sites.Square(L)
         H = qtx.operator.Heisenberg(J=[J1, J2], n_neighbor=[1, 2], msr=True)

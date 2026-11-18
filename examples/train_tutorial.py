@@ -116,7 +116,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import quantax as qtx
-from quantax.utils import create_run, close_run, log_progress, setup_plot_font
+from quantax.utils import create_run, close_run, log_devices, log_progress, setup_plot_font
 
 
 def write_json(path, data):
@@ -222,7 +222,7 @@ def main():
         logger.info(f"Symmetry settings: total_sz={TOTAL_SZ}; spin_inversion={SPIN_INVERSION}; momentum={MOMENTUM}")
         logger.info(f"Sampling: thermal_steps={THERMAL_STEPS}; sweep_steps={SWEEP_STEPS}; seed={SEED}")
         logger.info(f"Precision: dtype={DTYPE}; params_dtype={PARAMS_DTYPE}")
-        logger.info(f"Devices: {jax.devices()}")
+        log_devices(logger, jax.devices())
         settings = {key: value for key, value in globals().items() if key.isupper() and key != "PRESETS"}
         settings = json.loads(json.dumps(settings, default=str))
         write_json(run_dir / "config.json", settings)
