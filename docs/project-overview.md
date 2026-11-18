@@ -122,6 +122,8 @@ JAX 负责自动微分、编译和设备计算，Equinox 负责网络模块和�
 
 [train_symm.py](../examples/train_symm.py) 加入 `TotalSz() + SpinInverse() + C4v()` 约束后继续训练 10000 次，默认使用 10000 个样本。运行前将脚本开头的 `PARAM_FILE` 指向第一阶段运行目录中生成的 `.eqx` 文件，并确保 `DEPTH`、`CHANNELS` 和 `KERNEL_SIZE` 与权重匹配。脚本在独立的 `runs/<体系和格点名>/<运行时间>/` 中保存 `training.log`、能量和方差 PDF 及续训权重，曲线和权重文件名带 `symm`；最后一步也会保存曲线和权重。日志开头记录运行配置和权重来源，随后以与 `train.py` 相同的格式记录能量、方差、完成步数及耗时，异常时记录堆栈。
 
+续训权重也可以通过命令行指定：`.venv/bin/python examples/train_symm.py --param-file runs/<体系和格点名>/<运行时间>/<权重文件>.eqx`。该参数优先于脚本开头的 `PARAM_FILE`；两处都未设置时会提示指定权重，相对路径从当前工作目录解析。
+
 [measure.py](../examples/measure.py) 读取仓库提供的权重并反复采样测量能量，不更新参数。修改脚本中的 `network_idx` 可选择对应网络：
 
 | `network_idx` | 网络配置 | 参数文件 |

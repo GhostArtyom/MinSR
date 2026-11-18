@@ -99,16 +99,14 @@ import csv
 import hashlib
 import io
 import json
-import logging
 import math
 import os
 from contextlib import redirect_stdout
-from datetime import datetime
 from time import perf_counter
-from zoneinfo import ZoneInfo
 
 os.environ.setdefault("OMP_NUM_THREADS", "4")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.8")
 
 import jax
 import jax.numpy as jnp
@@ -117,32 +115,8 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib import font_manager
 import quantax as qtx
-
-logger = logging.getLogger("minsr.tutorial")
-
-
-def setup_plot_font():
-    """Require real Arial and preserve editable SVG text."""
-    try:
-        path = font_manager.findfont("Arial", fallback_to_default=False)
-    except ValueError:
-        # A newly installed system font may be missing from Matplotlib's cache.
-        for path in font_manager.findSystemFonts():
-            try:
-                family = font_manager.get_font(path).family_name
-            except (OSError, RuntimeError):
-                continue
-            if family == "Arial":
-                font_manager.fontManager.addfont(path)
-        try:
-            path = font_manager.findfont("Arial", fallback_to_default=False)
-        except ValueError as error:
-            raise RuntimeError("Install Arial before running this script.") from error
-    if font_manager.get_font(path).family_name != "Arial":
-        raise RuntimeError("Install Arial before running this script.")
-    plt.rcParams.update({"font.family": "Arial", "svg.fonttype": "none"})
+from quantax.utils import create_run, close_run, log_progress, setup_plot_font
 
 
 def write_json(path, data):
@@ -231,19 +205,9 @@ def main():
     shape = str(SIZE) if GEOMETRY == "chain" else f"{SIZE}x{SIZE}"
     couplings = f"J-{J1:g}_h-{H_FIELD:g}" if MODEL == "ising" else f"J1-{J1:g}_J2-{J2:g}"
     system_name = f"{TUTORIAL}_{GEOMETRY}_{shape}_{couplings}"
-    local_tz = ZoneInfo("Asia/Hong_Kong")
-    stamp = datetime.now(local_tz).strftime("%Y%m%d_%H%M%S")
-    run_dir = Path(OUTPUT_DIR) / system_name / stamp
-    run_dir.mkdir(parents=True, exist_ok=False)
-
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    handler = logging.FileHandler(run_dir / "training.log", mode="x", encoding="utf-8")
-    formatter = logging.Formatter("%(message)s")
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
+    run_dir, logger, handler = create_run(OUTPUT_DIR, system_name, "minsr.tutorial")
     try:
-        logger.info(f"Run directory: {run_dir}; timezone: {local_tz.key}")
+        logger.info(f"Run directory: {run_dir}")
         logger.info(f"System: {system_name}; model={MODEL}; PBC={PBC}")
         logger.info(
             f"Steps={STEPS}; symmetry_steps={SYMMETRY_STEPS}; exact_steps={EXACT_STEPS}; "
@@ -264,18 +228,17 @@ def main():
         write_json(run_dir / "config.json", settings)
         # QuSpin prints successful operator checks; keep routine output in the log concise.
         with io.StringIO() as output, redirect_stdout(output):
-            run_training(run_dir, system_name, start)
+            run_training(run_dir, system_name, start, logger)
     except (Exception, KeyboardInterrupt):
         logger.exception(f"Training stopped after {perf_counter() - start:.2f} s")
         raise
     finally:
-        logger.removeHandler(handler)
-        handler.close()
+        close_run(logger, handler)
         plt.close("all")
     return run_dir
 
 
-def run_training(run_dir, system_name, start):
+def run_training(run_dir, system_name, start, logger):
     if GEOMETRY not in ("chain", "square", "triangular") or SIZE < 2:
         raise ValueError("Choose chain/square/triangular and SIZE >= 2.")
     if MODEL not in ("ising", "heisenberg") or NETWORK not in ("ResSum", "RBM_Dense", "RBM_Conv"):
@@ -394,9 +357,9 @@ def run_training(run_dir, system_name, start):
                 data_file.flush()
                 records.append(row)
                 if i < nsteps and ((i + 1) % LOG_EVERY == 0 or i + 1 == nsteps):
-                    logger.info(
-                        f"E={energy:.6f}, Var={variance:.6g}, {i + 1}/{nsteps}, "
-                        f"{row['step_seconds']:.2f}, {row['elapsed_seconds']:.2f}"
+                    log_progress(
+                        logger, energy, variance, i + 1, nsteps,
+                        row["step_seconds"], row["elapsed_seconds"],
                     )
                 if i < nsteps and SAVE_EVERY and (i + 1) % SAVE_EVERY == 0:
                     state.save(run_dir / f"params_{system_name}_{phase}_{i + 1}.eqx")

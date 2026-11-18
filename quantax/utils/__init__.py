@@ -1,4 +1,6 @@
 from .data import DataTracer
+from .plot import setup_plot_font, save_training_plots
+from .logger import create_run, close_run, log_progress
 from .array import is_sharded_array, to_array_shard, to_array_replicate, array_extend
 from .tree import (
     tree_fully_flatten,

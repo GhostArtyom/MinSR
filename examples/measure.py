@@ -10,19 +10,17 @@ in Fig. 2b
 
 import csv
 import json
-import logging
 import os
-from datetime import datetime
 from pathlib import Path
 from time import perf_counter
-from zoneinfo import ZoneInfo
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.6")
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.8")
 
 import jax
 import quantax as qtx
 from quantax.symmetry import TotalSz, SpinInverse, C4v
+from quantax.utils import create_run, close_run, log_progress
 
 ROOT = Path(__file__).resolve().parents[1]
 network_idx = 1
@@ -39,7 +37,7 @@ J1, J2 = 1.0, 0.5
 PARAM_FILE = None  # None uses the supplied weights selected by network_idx.
 NSAMPLES = 10000
 STEPS = 100
-MAX_PARALLEL = 1024
+MAX_PARALLEL = 1024  # 32768
 THERMAL_STEPS = 100 * L * L
 SWEEP_STEPS = 10 * L * L
 OUTPUT_DIR = ROOT / "runs"
@@ -48,20 +46,9 @@ OUTPUT_DIR = ROOT / "runs"
 def main():
     start_time = perf_counter()
     system_name = f"j1j2_square_{L}x{L}_J1-{J1:g}_J2-{J2:g}"
-    local_tz = ZoneInfo("Asia/Hong_Kong")
-    timestamp = datetime.now(local_tz).strftime("%Y%m%d_%H%M%S")
-    run_dir = Path(OUTPUT_DIR) / system_name / timestamp
-    run_dir.mkdir(parents=True, exist_ok=False)
-
-    logger = logging.getLogger("minsr.measure")
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    handler = logging.FileHandler(run_dir / "measurement.log", mode="x", encoding="utf-8")
-    formatter = logging.Formatter("%(message)s")
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
+    run_dir, logger, handler = create_run(OUTPUT_DIR, system_name, "minsr.measure", log_file="measurement.log")
     try:
-        logger.info(f"Run directory: {run_dir}; timezone: {local_tz.key}")
+        logger.info(f"Run directory: {run_dir}")
         logger.info(f"System: {system_name}; periodic boundaries; total Sz=0")
         logger.info(f"Steps={STEPS}; samples={NSAMPLES}; max_parallel={MAX_PARALLEL}; reweight=2.0")
         logger.info(f"Sampling: thermal_steps={THERMAL_STEPS}; sweep_steps={SWEEP_STEPS}")
@@ -109,9 +96,9 @@ def main():
                     step_end - step_start, step_end - start_time,
                 ])))
                 data_file.flush()
-                logger.info(
-                    f"E={mean_energy:.6f}, Var={mean_variance:.6g}, "
-                    f"{i + 1}/{STEPS}, {step_end - step_start:.2f}, {step_end - start_time:.2f}"
+                log_progress(
+                    logger, mean_energy, mean_variance, i + 1, STEPS,
+                    step_end - step_start, step_end - start_time,
                 )
 
         summary = {
@@ -130,8 +117,7 @@ def main():
         logger.exception(f"Measurement stopped after {perf_counter() - start_time:.2f} s")
         raise
     finally:
-        logger.removeHandler(handler)
-        handler.close()
+        close_run(logger, handler)
     return run_dir
 
 
