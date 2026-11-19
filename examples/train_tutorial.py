@@ -62,7 +62,7 @@ THERMAL_STEPS = None  # 初始化采样器时的热化步数；None 使用 20 * 
 SWEEP_STEPS = None  # 每次采样的 Metropolis 更新步数；None 使用 2 * 格点数
 SEED = 2347  # 训练随机种子
 PARAMS_DTYPE = "float32"  # 可训练网络参数的精度，与 DTYPE 分开设置
-LOG_EVERY = 10  # 每隔多少次更新向 training.log 写入 E、Var、完成步数和耗时
+LOG_EVERY = 10  # 每隔多少次更新向训练日志写入 E、Var、完成步数和耗时
 SAVE_EVERY = 100  # 中间权重的保存间隔；0 表示只保存各阶段最终权重
 
 ED_MAX_DIM = 2**20  # ED 基底维数上界的限制，在枚举基底之前检查
@@ -228,7 +228,7 @@ def main():
         write_json(run_dir / "config.json", settings)
         # QuSpin prints successful operator checks; keep routine output in the log concise.
         with io.StringIO() as output, redirect_stdout(output):
-            run_training(run_dir, system_name, start, logger)
+            run_training(run_dir, start, logger)
     except (Exception, KeyboardInterrupt):
         logger.exception(f"Training stopped after {perf_counter() - start:.2f} s")
         raise
@@ -238,7 +238,7 @@ def main():
     return run_dir
 
 
-def run_training(run_dir, system_name, start, logger):
+def run_training(run_dir, start, logger):
     if GEOMETRY not in ("chain", "square", "triangular") or SIZE < 2:
         raise ValueError("Choose chain/square/triangular and SIZE >= 2.")
     if MODEL not in ("ising", "heisenberg") or NETWORK not in ("ResSum", "RBM_Dense", "RBM_Conv"):
@@ -362,8 +362,8 @@ def run_training(run_dir, system_name, start, logger):
                         row["step_seconds"], row["elapsed_seconds"],
                     )
                 if i < nsteps and SAVE_EVERY and (i + 1) % SAVE_EVERY == 0:
-                    state.save(run_dir / f"params_{system_name}_{phase}_{i + 1}.eqx")
-            state.save(run_dir / f"params_{system_name}_{phase}_final.eqx")
+                    state.save(run_dir / f"params_{phase}_{i + 1}.eqx")
+            state.save(run_dir / f"params_{phase}_final.eqx")
 
         state = None
         try:
@@ -377,7 +377,7 @@ def run_training(run_dir, system_name, start, logger):
                 train(state, "symmetric", SYMMETRY_STEPS, offset=STEPS)
         except BaseException:
             if state is not None:
-                checkpoint = run_dir / f"params_{system_name}_interrupted.eqx"
+                checkpoint = run_dir / "params_interrupted.eqx"
                 state.save(checkpoint)
             raise
 
@@ -392,7 +392,7 @@ def run_training(run_dir, system_name, start, logger):
     ax.set(xlabel="Parameter updates", ylabel="Energy per site", title=f"{TUTORIAL}: {GEOMETRY}, N={nsites}")
     ax.legend()
     ax.grid(alpha=0.2)
-    figure_path = run_dir / f"energy_{system_name}.svg"
+    figure_path = run_dir / "energy.svg"
     fig.savefig(figure_path)
     plt.close(fig)
     write_json(run_dir / "summary.json", {"final_measurement": records[-1], "seconds": perf_counter() - start, "jax": jax.__version__})

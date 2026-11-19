@@ -19,7 +19,7 @@ from quantax.utils import (
 L = 10
 J1, J2 = 1.0, 0.5
 DEPTH, CHANNELS, KERNEL_SIZE, USE_SINH = 16, 16, 3, True
-NSAMPLES = 1000  # 10000
+NSAMPLES = 10000
 STEPS = 2000  # 20000
 STEP_SIZE = 1e-3
 MAX_PARALLEL = 32768
@@ -64,9 +64,9 @@ def main():
             energy.append(optimizer.energy)
             VarE.append(optimizer.VarE)
             if (n + 1) % 10 == 0 or n + 1 == STEPS:
-                save_training_plots(energy, VarE, run_dir, system_name, title, n + 1, baseline=baseline)
+                save_training_plots(energy, VarE, run_dir, title, n + 1, baseline=baseline)
             if (n + 1) % 100 == 0 or n + 1 == STEPS:
-                state.save(run_dir / f"params_{system_name}_{n + 1}.eqx")
+                state.save(run_dir / f"params_{n + 1}.eqx")
 
             jax.block_until_ready(state.ansatz)
             step_end = perf_counter()

@@ -31,7 +31,7 @@ def setup_plot_font() -> None:
     mpl.rcParams.update({"font.family": "Arial", "pdf.fonttype": 42, "svg.fonttype": "none"})
 
 
-def save_training_plots(energy, variance, run_dir, system_name, title, step, baseline=None, suffix=""):
+def save_training_plots(energy, variance, run_dir, title, step, baseline=None, suffix=""):
     """Save full and rolling views of the energy and variance traces."""
     run_dir = Path(run_dir)
     batch = min(10, step)
@@ -57,6 +57,6 @@ def save_training_plots(energy, variance, run_dir, system_name, title, step, bas
                     ax.set_xlim(left=tracer.time[start:][0])
                 ax.set(title=title, xlabel="Update index", ylabel=ylabel)
                 fig.tight_layout()
-                fig.savefig(run_dir / f"{prefix}_{system_name}{suffix}{view_suffix}.pdf")
+                fig.savefig(run_dir / f"{prefix}{suffix}{view_suffix}.pdf")
             finally:
                 plt.close(fig)

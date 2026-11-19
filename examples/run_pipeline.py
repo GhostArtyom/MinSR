@@ -9,7 +9,7 @@ from pathlib import Path
 SHARED_SETTINGS = ("L", "J1", "J2", "KERNEL_SIZE", "USE_SINH")
 
 
-def _stage_worker(stage, checkpoint, result):
+def _stage_worker(stage, checkpoint, result, *, legacy_summary=True):
     # Import JAX only in the child so each stage gets fresh process-wide state.
     from examples import train
 
@@ -20,6 +20,9 @@ def _stage_worker(stage, checkpoint, result):
     with result:
         if stage == "measure":
             run_dir = module.main(checkpoint, network_config=(train.DEPTH, train.CHANNELS))
+            if legacy_summary:
+                # A launcher already running before the rename still looks for summary_*.json.
+                (run_dir / f"summary_{run_dir.parent.name}.json").symlink_to("summary.json")
             result.send((run_dir, None))
             return
 
@@ -31,11 +34,11 @@ def _stage_worker(stage, checkpoint, result):
         else:
             run_dir = module.main()
 
-        # Look only in the directory returned by this stage, never in older runs.
-        checkpoints = list(run_dir.glob(f"params_*_{module.STEPS}.eqx"))
-        if len(checkpoints) != 1 or not checkpoints[0].is_file():
-            raise RuntimeError(f"Expected one final checkpoint at step {module.STEPS} in {run_dir}.")
-        result.send((run_dir, checkpoints[0]))
+        suffix = "_symm" if stage == "train_symm" else ""
+        final_checkpoint = run_dir / f"params{suffix}_{module.STEPS}.eqx"
+        if not final_checkpoint.is_file():
+            raise RuntimeError(f"Final checkpoint not found: {final_checkpoint}")
+        result.send((run_dir, final_checkpoint))
 
 
 def _run_stage(stage, checkpoint):
@@ -43,7 +46,7 @@ def _run_stage(stage, checkpoint):
     received, send = context.Pipe(duplex=False)
     with received, send:
         process = context.Process(
-            target=_stage_worker, args=(stage, checkpoint, send),
+            target=_stage_worker, args=(stage, checkpoint, send), kwargs={"legacy_summary": False},
         )
         print(f"Starting {stage}...", flush=True)
         process.start()
@@ -78,7 +81,9 @@ def main(from_checkpoint=None):
     _, checkpoint = _run_stage("train_symm", checkpoint)
     print(f"Symmetry checkpoint: {checkpoint}", flush=True)
     measured_dir, _ = _run_stage("measure", checkpoint)
-    summary, = measured_dir.glob("summary_*.json")
+    summary = measured_dir / "summary.json"
+    if not summary.is_file():
+        raise RuntimeError(f"Measurement summary not found: {summary}")
     print(f"Measurement summary: {summary}", flush=True)
     return measured_dir
 

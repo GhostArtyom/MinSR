@@ -120,9 +120,9 @@ JAX 负责自动微分、编译和设备计算，Equinox 负责网络模块和�
 
 从仓库根目录运行 `.venv/bin/python -m examples.run_pipeline` 可依次训练、对称续训和测量，自动传递各阶段的最终权重。已有第一阶段权重时可加 `--from-checkpoint <权重文件>` 跳过训练。三阶段共用 `train.py` 的体系和网络设置，各自的步数、采样参数和保存位置与单独运行时一致。
 
-[train.py](../examples/train.py) 在 10×10 周期方格上用 MinSR 训练 $J_1=1$、$J_2=0.5$ 的模型。每次运行在 `runs/<体系和格点名>/<运行时间>/` 保存日志、曲线和权重。`training.log` 记录运行配置、硬件、逐步能量、方差和耗时。
+[train.py](../examples/train.py) 在 10×10 周期方格上用 MinSR 训练 $J_1=1$、$J_2=0.5$ 的模型。每次运行在 `runs/<体系和格点名>/<运行时间>/` 保存 `training.log`、`energy.pdf`、`VarE.pdf` 和 `params_<步数>.eqx` 等文件。体系信息已包含在目录名中，文件名不再重复。日志记录运行配置、硬件、逐步能量、方差和耗时。
 
-[train_symm.py](../examples/train_symm.py) 加入 `TotalSz() + SpinInverse() + C4v()` 约束后继续训练 10000 次，默认使用 10000 个样本。运行前将脚本开头的 `PARAM_FILE` 指向第一阶段运行目录中生成的 `.eqx` 文件，并确保 `DEPTH`、`CHANNELS` 和 `KERNEL_SIZE` 与权重匹配。脚本在独立的 `runs/<体系和格点名>/<运行时间>/` 中保存 `training.log`、能量和方差 PDF 及续训权重，曲线和权重文件名带 `symm`；最后一步也会保存曲线和权重。日志开头记录运行配置和权重来源，随后以与 `train.py` 相同的格式记录能量、方差、完成步数及耗时，异常时记录堆栈。
+[train_symm.py](../examples/train_symm.py) 加入 `TotalSz() + SpinInverse() + C4v()` 约束后继续训练。运行前将脚本开头的 `PARAM_FILE` 指向第一阶段运行目录中生成的 `.eqx` 文件，并确保 `DEPTH`、`CHANNELS` 和 `KERNEL_SIZE` 与权重匹配。脚本在独立的 `runs/<体系和格点名>/<运行时间>/` 中保存 `training_symm.log`、`energy_symm.pdf`、`VarE_symm.pdf` 和 `params_symm_<步数>.eqx` 等文件。日志开头记录运行配置和权重来源，随后以与 `train.py` 相同的格式记录能量、方差、完成步数及耗时，异常时记录堆栈。
 
 续训权重也可以通过命令行指定：`.venv/bin/python examples/train_symm.py --param-file runs/<体系和格点名>/<运行时间>/<权重文件>.eqx`。该参数优先于脚本开头的 `PARAM_FILE`；两处都未设置时会提示指定权重，相对路径从当前工作目录解析。
 
@@ -136,7 +136,7 @@ JAX 负责自动微分、编译和设备计算，Equinox 负责网络模块和�
 | 2 | 16 层、32 通道、3×3 卷积核 | `square10x10_1632.eqx` |
 | 3 | 30 层、64 通道、3×3 卷积核 | `square10x10_3064.eqx` |
 
-测量脚本的注释将这些网络对应到论文图 2b 中的 ResNet2（MinSR）结果。`.eqx` 文件保存网络权重，加载时仍须创建匹配的网络结构。`PARAM_FILE = None` 时读取表中自带权重，也可显式指定同结构的权重文件。默认进行 100 轮测量，每轮 10000 个样本；`THERMAL_STEPS` 和 `SWEEP_STEPS` 分别控制初始化热化和每轮采样的更新次数。每次运行创建独立的 `runs/<体系和格点名>/<运行时间>/`，`measurement.log` 开头记录运行配置和权重来源，随后记录累计平均能量、累计方差、完成步数与耗时；`measurement_<体系和格点名>.csv` 逐轮保存能量、局域能量二阶矩、累计平均能量和累计方差，并立即刷新；`summary_<体系和格点名>.json` 保存最终测量结果和权重来源。中断时保留已写入的 CSV，不生成最终汇总。
+测量脚本的注释将这些网络对应到论文图 2b 中的 ResNet2（MinSR）结果。`.eqx` 文件保存网络权重，加载时仍须创建匹配的网络结构。`PARAM_FILE = None` 时读取表中自带权重，也可显式指定同结构的权重文件。`THERMAL_STEPS` 和 `SWEEP_STEPS` 分别控制初始化热化和每轮采样的更新次数。每次运行创建独立的 `runs/<体系和格点名>/<运行时间>/`，`measurement.log` 开头记录运行配置和权重来源，随后记录累计平均能量、累计方差、完成步数与耗时；`measurement.csv` 逐轮保存能量、局域能量二阶矩、累计平均能量和累计方差，并立即刷新；`summary.json` 保存最终测量结果和权重来源。中断时保留已写入的 CSV，不生成最终汇总。
 
 ## 读数和运行时需要核对的约定
 

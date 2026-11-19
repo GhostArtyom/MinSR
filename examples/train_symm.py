@@ -24,7 +24,7 @@ L = 10
 J1, J2 = 1.0, 0.5
 DEPTH, CHANNELS, KERNEL_SIZE, USE_SINH = 16, 16, 3, True
 PARAM_FILE = None  # "params_20000.eqx"
-NSAMPLES = 1000  # 10000
+NSAMPLES = 10000
 STEPS = 1000  # 10000
 STEP_SIZE = 1e-3
 MAX_PARALLEL = 32768
@@ -40,7 +40,9 @@ def main(param_file=None):
         raise FileNotFoundError(f"Input weights do not exist: {param_file}")
     start_time = perf_counter()
     system_name = f"j1j2_square_{L}x{L}_J1-{J1:g}_J2-{J2:g}"
-    run_dir, logger, handler = create_run(OUTPUT_DIR, system_name, "minsr.train_symm")
+    run_dir, logger, handler = create_run(
+        OUTPUT_DIR, system_name, "minsr.train_symm", log_file="training_symm.log",
+    )
     try:
         logger.info(f"Run directory: {run_dir}")
         logger.info(f"Input weights: {param_file}")
@@ -76,10 +78,10 @@ def main(param_file=None):
             VarE.append(optimizer.VarE)
             if (n + 1) % 10 == 0 or n + 1 == STEPS:
                 save_training_plots(
-                    energy, VarE, run_dir, system_name, title, n + 1, baseline=baseline, suffix="_symm",
+                    energy, VarE, run_dir, title, n + 1, baseline=baseline, suffix="_symm",
                 )
             if (n + 1) % 100 == 0 or n + 1 == STEPS:
-                state.save(run_dir / f"params_{system_name}_symm_{n + 1}.eqx")
+                state.save(run_dir / f"params_symm_{n + 1}.eqx")
             jax.block_until_ready(state.ansatz)
             step_end = perf_counter()
             log_progress(

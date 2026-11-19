@@ -34,8 +34,8 @@ KERNEL_SIZE, USE_SINH = 3, True
 L = 10
 J1, J2 = 1.0, 0.5
 PARAM_FILE = None  # None uses the supplied weights selected by network_idx.
-NSAMPLES = 1000  # 10000
-STEPS = 10  # 100
+NSAMPLES = 10000
+STEPS = 100
 MAX_PARALLEL = 32768
 THERMAL_STEPS = 100 * L * L
 SWEEP_STEPS = 10 * L * L
@@ -87,7 +87,7 @@ def main(param_file=None, *, network_config=None):
         energy_data = qtx.utils.DataTracer()
         second_moment_data = qtx.utils.DataTracer()
         fields = ["step", "energy", "second_moment", "mean_energy", "mean_variance", "step_seconds", "elapsed_seconds"]
-        with (run_dir / f"measurement_{system_name}.csv").open("x", newline="", encoding="utf-8") as data_file:
+        with (run_dir / "measurement.csv").open("x", newline="", encoding="utf-8") as data_file:
             writer = csv.DictWriter(data_file, fieldnames=fields)
             writer.writeheader()
             data_file.flush()
@@ -120,7 +120,7 @@ def main(param_file=None, *, network_config=None):
             "energy": mean_energy, "energy_per_site": mean_energy / (L * L), "variance": mean_variance,
             "seconds": perf_counter() - start_time,
         }
-        (run_dir / f"summary_{system_name}.json").write_text(
+        (run_dir / "summary.json").write_text(
             json.dumps(summary, indent=2, allow_nan=False) + "\n", encoding="utf-8",
         )
     except (Exception, KeyboardInterrupt):
