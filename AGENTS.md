@@ -9,6 +9,11 @@ MinSR is the reproduction repository for *Empowering deep neural quantum states 
 - [`params/`](params/), [`data/`](data/), and [`images/`](images/) contain bundled checkpoints, data, and figures. Keep generated logs, plots, and checkpoints under the ignored `runs/` directory rather than overwriting these assets.
 - See the [project overview](docs/project-overview.md) and [tutorial guide](docs/tutorial-guide.md) for the workflows. Update the relevant guide if a change affects documented commands, inputs, or outputs.
 
+## Run artifacts in Git
+
+- Keep `runs/` ignored by default. When asked to commit results from completed runs, force-add only the final `.eqx` checkpoint from each selected training stage and the corresponding `.log` and PDF plots. For completed measurements, include `measurement.log`, `measurement.csv`, `summary.json`, and any PDFs, not a copy of the input checkpoint.
+- Leave intermediate checkpoints, other CSV/JSON outputs, and smoke or benchmark runs untracked. Add files by explicit path, not the entire run directory.
+
 ## Environments and checks
 
 - Run commands from the repository root. Follow the [README installation instructions](README.md#installation) to set up the root `.venv/`. The [Python 3.9 / JAX 0.4.25](environments/py39-jax0425/) and [Python 3.11 / JAX 0.6.2](environments/py311-jax062/) environments have independent lockfiles; update only the one affected by a dependency change.
