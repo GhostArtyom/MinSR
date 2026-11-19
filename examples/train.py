@@ -19,8 +19,8 @@ from quantax.utils import (
 L = 10
 J1, J2 = 1.0, 0.5
 DEPTH, CHANNELS, KERNEL_SIZE, USE_SINH = 16, 16, 3, True
-NSAMPLES = 10000
-STEPS = 2000  # 20000
+NSAMPLES = 1000  # 10000
+STEPS = 20000
 STEP_SIZE = 1e-3
 MAX_PARALLEL = 32768
 OUTPUT_DIR = Path(__file__).resolve().parents[1] / "runs"
