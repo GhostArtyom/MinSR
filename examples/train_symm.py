@@ -1,9 +1,14 @@
-"""Choose input weights with --param-file or set PARAM_FILE below."""
+"""Continue training with symmetry using the weights from --param-file."""
 
 import argparse
 import os
 from pathlib import Path
 from time import perf_counter
+
+if __package__:
+    from .run_pipeline import add_config_arguments, get_stage_config
+else:
+    from run_pipeline import add_config_arguments, get_stage_config
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.8")
@@ -19,22 +24,12 @@ from quantax.utils import (
     create_run, close_run, log_devices, log_progress, setup_plot_font, save_training_plots,
 )
 
-ROOT = Path(__file__).resolve().parents[1]
-L = 10
-J1, J2 = 1.0, 0.5
-DEPTH, CHANNELS, KERNEL_SIZE, USE_SINH = 16, 16, 3, True
-PARAM_FILE = None  # "params_20000.eqx"
-NSAMPLES = 1000  # 10000
-STEPS = 10000
-STEP_SIZE = 1e-3
-MAX_PARALLEL = 32768
-OUTPUT_DIR = ROOT / "runs"
-
-
-def main(param_file=None):
-    param_file = PARAM_FILE if param_file is None else param_file
+def _train(
+    param_file, *, L, J1, J2, DEPTH, CHANNELS, KERNEL_SIZE, USE_SINH,
+    NSAMPLES, STEPS, STEP_SIZE, MAX_PARALLEL, OUTPUT_DIR,
+):
     if param_file is None:
-        raise ValueError("Choose input weights with --param-file PATH or set PARAM_FILE at the top of this script.")
+        raise ValueError("Choose input weights with --param-file PATH.")
     param_file = Path(param_file).expanduser().resolve()
     if not param_file.is_file():
         raise FileNotFoundError(f"Input weights do not exist: {param_file}")
@@ -97,10 +92,15 @@ def main(param_file=None):
     return run_dir
 
 
+def main(param_file=None, **overrides):
+    return _train(param_file, **get_stage_config("train_symm", **overrides))
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument(
-        "--param-file", type=Path, default=PARAM_FILE, required=PARAM_FILE is None,
-        help="Input checkpoint; relative paths are resolved from the working directory. Overrides PARAM_FILE.",
+        "--param-file", type=Path, required=True,
+        help="Input checkpoint; relative paths are resolved from the working directory.",
     )
-    main(parser.parse_args().param_file)
+    add_config_arguments(parser, "train_symm")
+    main(**vars(parser.parse_args()))

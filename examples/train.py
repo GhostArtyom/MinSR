@@ -1,6 +1,11 @@
+import argparse
 import os
-from pathlib import Path
 from time import perf_counter
+
+if __package__:
+    from .run_pipeline import add_config_arguments, get_stage_config
+else:
+    from run_pipeline import add_config_arguments, get_stage_config
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.8")
@@ -16,17 +21,12 @@ from quantax.utils import (
     create_run, close_run, log_devices, log_progress, setup_plot_font, save_training_plots,
 )
 
-L = 10
-J1, J2 = 1.0, 0.5
-DEPTH, CHANNELS, KERNEL_SIZE, USE_SINH = 16, 16, 3, True
-NSAMPLES = 1000  # 10000
-STEPS = 20000
-STEP_SIZE = 1e-3
-MAX_PARALLEL = 32768
-OUTPUT_DIR = Path(__file__).resolve().parents[1] / "runs"
-
-
-def main():
+def _train(
+    *, L, J1, J2, DEPTH, CHANNELS, KERNEL_SIZE, USE_SINH,
+    NSAMPLES, STEPS, STEP_SIZE, MAX_PARALLEL, OUTPUT_DIR,
+):
+    if STEPS < 1:
+        raise ValueError("Require STEPS >= 1.")
     start_time = perf_counter()
     system_name = f"j1j2_square_{L}x{L}_J1-{J1:g}_J2-{J2:g}"
     run_dir, logger, handler = create_run(OUTPUT_DIR, system_name, "minsr.train")
@@ -83,5 +83,11 @@ def main():
     return run_dir
 
 
+def main(**overrides):
+    return _train(**get_stage_config("train", **overrides))
+
+
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Train a neural quantum state with MinSR.", allow_abbrev=False)
+    add_config_arguments(parser, "train")
+    main(**vars(parser.parse_args()))

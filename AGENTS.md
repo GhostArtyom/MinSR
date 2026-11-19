@@ -5,14 +5,15 @@ MinSR is the reproduction repository for *Empowering deep neural quantum states 
 ## Repository guide
 
 - [`quantax/`](quantax/) contains the implementation. Start with [`quantax/optimizer/minsr.py`](quantax/optimizer/minsr.py) for MinSR and [`quantax/optimizer/tdvp.py`](quantax/optimizer/tdvp.py) for the shared optimization logic.
-- [`examples/`](examples/) contains training, symmetry-constrained continuation, and energy measurement scripts. Start with [`examples/train_tutorial.py`](examples/train_tutorial.py) or the [tutorial notebooks](tutorials/) for smaller systems. For `train_symm.py`, pass `--param-file` or set `PARAM_FILE`, and match the network configuration to the checkpoint.
+- [`examples/`](examples/) contains training, symmetry-constrained continuation, and energy measurement scripts. Edit the configuration block in [`examples/run_pipeline.py`](examples/run_pipeline.py) and run `python -m examples.run_pipeline` without arguments to run all three stages. For standalone `train_symm.py`, pass `--param-file` and match the network configuration to the checkpoint. Start with [`examples/train_tutorial.py`](examples/train_tutorial.py) or the [tutorial notebooks](tutorials/) for smaller systems.
 - [`params/`](params/), [`data/`](data/), and [`images/`](images/) contain bundled checkpoints, data, and figures. Keep generated logs, plots, and checkpoints under the ignored `runs/` directory rather than overwriting these assets.
 - See the [project overview](docs/project-overview.md) and [tutorial guide](docs/tutorial-guide.md) for the workflows. Update the relevant guide if a change affects documented commands, inputs, or outputs.
 
-## Run artifacts in Git
+## Run directories and Git
 
-- Keep `runs/` ignored by default. When asked to commit results from completed runs, force-add only the final `.eqx` checkpoint from each selected training stage and the corresponding `.log` and PDF plots. For completed measurements, include `measurement.log`, `measurement.csv`, `summary.json`, and any PDFs, not a copy of the input checkpoint.
-- Leave intermediate checkpoints, other CSV/JSON outputs, and smoke or benchmark runs untracked. Add files by explicit path, not the entire run directory.
+- Keep production runs under `runs/<system>/<timestamp>/`. Put any pipeline console log and PID file in the first stage's run directory rather than a separate launcher directory. Use separate temporary directories only for debugging or smoke tests.
+- Keep `runs/` ignored by default. When asked to commit results from completed runs, force-add only the final `.eqx` checkpoint from each selected training stage and the corresponding stage log and PDF plots. For completed measurements, include `measurement.log`, `measurement.csv`, `summary.json`, and any PDFs, not a copy of the input checkpoint.
+- Leave launcher logs, PID files, intermediate checkpoints, other CSV/JSON outputs, and smoke or benchmark runs untracked. Add files by explicit path, not the entire run directory.
 
 ## Environments and checks
 

@@ -8,11 +8,17 @@ The variational energies of these networks correspond to the results of ResNet2(
 in Fig. 2b
 """
 
+import argparse
 import csv
 import json
 import os
 from pathlib import Path
 from time import perf_counter
+
+if __package__:
+    from .run_pipeline import add_config_arguments, get_stage_config
+else:
+    from run_pipeline import add_config_arguments, get_stage_config
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.8")
@@ -23,26 +29,19 @@ from quantax.symmetry import TotalSz, SpinInverse, C4v
 from quantax.utils import create_run, close_run, log_devices, log_progress
 
 ROOT = Path(__file__).resolve().parents[1]
-network_idx = 1
 # Each preset specifies depth, channels, and the matching supplied weights.
 NETWORKS = {
     1: (16, 16, "square10x10_1616.eqx"),
     2: (16, 32, "square10x10_1632.eqx"),
     3: (30, 64, "square10x10_3064.eqx"),
 }
-KERNEL_SIZE, USE_SINH = 3, True
-L = 10
-J1, J2 = 1.0, 0.5
-PARAM_FILE = None  # None uses the supplied weights selected by network_idx.
-NSAMPLES = 1000  # 10000
-STEPS = 100
-MAX_PARALLEL = 32768
-THERMAL_STEPS = 100 * L * L
-SWEEP_STEPS = 10 * L * L
-OUTPUT_DIR = ROOT / "runs"
+DEFAULT_NETWORK_IDX = 1
 
 
-def main(param_file=None, *, network_config=None):
+def _measure(
+    param_file, preset, *, L, J1, J2, DEPTH, CHANNELS, KERNEL_SIZE, USE_SINH,
+    NSAMPLES, STEPS, MAX_PARALLEL, THERMAL_STEPS, SWEEP_STEPS, OUTPUT_DIR,
+):
     start_time = perf_counter()
     system_name = f"j1j2_square_{L}x{L}_J1-{J1:g}_J2-{J2:g}"
     run_dir, logger, handler = create_run(OUTPUT_DIR, system_name, "minsr.measure", log_file="measurement.log")
@@ -54,29 +53,16 @@ def main(param_file=None, *, network_config=None):
         logger.info(f"Symmetry: TotalSz(0) + SpinInverse() + C4v()")
         if STEPS < 1 or NSAMPLES < 1 or MAX_PARALLEL < 16:
             raise ValueError("Require STEPS >= 1, NSAMPLES >= 1 and MAX_PARALLEL >= 16 for this symmetry.")
-        param_file = PARAM_FILE if param_file is None else param_file
-        preset = None
-        if network_config is None:
-            preset = network_idx
-            if preset not in NETWORKS:
-                raise ValueError("Wrong network index.")
-            depth, channels, filename = NETWORKS[preset]
-            if param_file is None:
-                param_file = ROOT / "params" / filename
-        else:
-            depth, channels = network_config
-            if param_file is None:
-                raise ValueError("A custom network requires an explicit checkpoint.")
         param_file = Path(param_file).expanduser().resolve()
         preset_label = f"index={preset}; " if preset is not None else ""
-        logger.info(f"Network: {preset_label}ResSum(depth={depth}, channels={channels}, kernel_size={KERNEL_SIZE}, use_sinh={USE_SINH})")
+        logger.info(f"Network: {preset_label}ResSum(depth={DEPTH}, channels={CHANNELS}, kernel_size={KERNEL_SIZE}, use_sinh={USE_SINH})")
         logger.info(f"Input weights: {param_file.resolve()}")
         if not param_file.is_file():
             raise FileNotFoundError(f"Measurement weights do not exist: {param_file}")
         log_devices(logger, jax.devices())
         qtx.sites.Square(L)
         H = qtx.operator.Heisenberg(J=[J1, J2], n_neighbor=[1, 2], msr=True)
-        net = qtx.nn.ResSum(depth, channels, KERNEL_SIZE, use_sinh=USE_SINH)
+        net = qtx.nn.ResSum(DEPTH, CHANNELS, KERNEL_SIZE, use_sinh=USE_SINH)
         state = qtx.state.Variational(
             net, param_file=param_file, symm=TotalSz() + SpinInverse() + C4v(), max_parallel=MAX_PARALLEL,
         )
@@ -113,7 +99,7 @@ def main(param_file=None, *, network_config=None):
 
         summary = {
             "system": system_name, "network_idx": preset,
-            "network": {"depth": depth, "channels": channels, "kernel_size": KERNEL_SIZE, "use_sinh": USE_SINH},
+            "network": {"depth": DEPTH, "channels": CHANNELS, "kernel_size": KERNEL_SIZE, "use_sinh": USE_SINH},
             "param_file": str(param_file.resolve()), "symmetry": "TotalSz(0) + SpinInverse() + C4v()",
             "nsamples": NSAMPLES, "steps": STEPS, "max_parallel": MAX_PARALLEL,
             "thermal_steps": THERMAL_STEPS, "sweep_steps": SWEEP_STEPS,
@@ -131,5 +117,31 @@ def main(param_file=None, *, network_config=None):
     return run_dir
 
 
+def main(param_file=None, *, network_config=None, network_idx=None, **overrides):
+    config = get_stage_config("measure", **overrides)
+    if network_config is None and ("DEPTH" in overrides or "CHANNELS" in overrides):
+        network_config = (config["DEPTH"], config["CHANNELS"])
+    preset = None
+    if network_config is None:
+        preset = DEFAULT_NETWORK_IDX if network_idx is None else network_idx
+        if preset not in NETWORKS:
+            raise ValueError("Wrong network index.")
+        depth, channels, filename = NETWORKS[preset]
+        if param_file is None:
+            param_file = ROOT / "params" / filename
+    else:
+        if network_idx is not None:
+            raise ValueError("Use either --network-idx or a custom network, not both.")
+        depth, channels = network_config
+        if param_file is None:
+            raise ValueError("A custom network requires --param-file.")
+    config.update(DEPTH=depth, CHANNELS=channels)
+    return _measure(param_file, preset, **config)
+
+
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument("--param-file", type=Path, help="Measure this checkpoint instead of the preset weights.")
+    parser.add_argument("--network-idx", type=int, choices=NETWORKS, help=f"Default preset: {DEFAULT_NETWORK_IDX}")
+    add_config_arguments(parser, "measure")
+    main(**vars(parser.parse_args()))
