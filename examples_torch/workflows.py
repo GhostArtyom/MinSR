@@ -28,6 +28,8 @@ def _system(config, symmetric, checkpoint=None):
     if symmetric:
         symm += qtx.symmetry.SpinInverse() + qtx.symmetry.C4v()
     net = qtx.nn.ResSum(**config.network)
+    if device.type == "cuda" and not symmetric:
+        net.to(memory_format=torch.channels_last)
     state = qtx.state.Variational(net, symm=symm, max_parallel=config.max_parallel, device=device)
     if checkpoint is not None:
         if checkpoint.suffix == ".eqx":
@@ -66,6 +68,7 @@ def _header(logger, config, state, steps, thermal, sweep, symmetric, reweight, c
 def _sampler(config, state, reweight, thermal, sweep):
     return qtx.sampler.NeighborExchange(
         state, config.nsamples, reweight=reweight, n_neighbor=[1, 2], thermal_steps=thermal, sweep_steps=sweep,
+        cuda_graph=state.nsymm == 1,
     )
 
 

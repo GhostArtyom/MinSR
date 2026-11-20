@@ -85,7 +85,7 @@ CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=1 \
   environments/py311-torch/.venv/bin/python -m scripts.check_torch --reference runs/torch-reference
 ```
 
-已通过 4×4 方格的固定输入对照。JAX/Torch 局域能量的最大绝对差为 $2.74\times10^{-7}$，MinSR 更新向量的最大绝对差为 $3.87\times10^{-6}$。Torch 环境未安装 QuSpin，三个独立入口均通过 8 样本、每阶段 2 步的 CPU 短测。另一组 CPU 测试验证了两个进程分片计算与单进程的更新一致。CUDA 和完整流水线的数值及性能验收仍待执行。
+已通过 4×4 方格的固定输入对照。JAX/Torch 局域能量的最大绝对差为 $2.74\times10^{-7}$，MinSR 更新向量的最大绝对差为 $3.87\times10^{-6}$。Torch 环境未安装 QuSpin，三个独立入口均通过 8 样本、每阶段 2 步的 CPU 短测。另一组 CPU 测试验证了两个进程分片计算与单进程的更新一致。CUDA 普通训练的固定输入检查和 50 步性能对照见[实现改进](implementation-improvements.md#pytorch普通训练的-cuda-性能)。完整流水线的正式数值验收仍未完成。
 
 ## 5. 验收与比较方法
 

@@ -6,6 +6,15 @@ from .initializers import lecun_normal
 from ..global_defs import get_params_dtype
 
 
+def _circular_pad(x, pads):
+    pad = tuple(value for pair in reversed(pads) for value in pair)
+    if len(pads) == 2 and x.ndim == 4 and x.is_contiguous(memory_format=torch.channels_last):
+        # F.pad allocates a contiguous output. Pad the NHWC view so cuDNN
+        # can consume it without a layout conversion on every convolution.
+        return F.pad(x.permute(0, 2, 3, 1), (0, 0, *pad), mode="circular").permute(0, 3, 1, 2)
+    return F.pad(x, pad, mode="circular")
+
+
 class NoGradLayer(nn.Module):
     """A layer whose state is registered as buffers."""
 
@@ -78,8 +87,7 @@ class Conv(nn.Module):
         if padding == "CIRCULAR":
             dims = len(self.kernel_size)
             if all(max(pair) <= size for pair, size in zip(self._circular_pads, x.shape[-dims:])):
-                pad = tuple(value for pair in reversed(self._circular_pads) for value in pair)
-                x = F.pad(x, pad, mode="circular")
+                x = _circular_pad(x, self._circular_pads)
             else:
                 for axis, (left, right) in enumerate(self._circular_pads, start=x.ndim - dims):
                     size = x.shape[axis]

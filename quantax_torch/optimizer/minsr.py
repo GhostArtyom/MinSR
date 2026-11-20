@@ -4,6 +4,7 @@ import torch
 from torch import distributed
 from torch.func import functional_call, vjp, vmap
 
+from ._res_sum import batched_res_sum_vjp
 from .solver import minsr_pinv_eig
 from .tdvp import TDVP, _stack_components
 from ..nn import Sequential
@@ -107,6 +108,11 @@ class MinSR(TDVP):
 
     @torch.no_grad()
     def _block_vjp(self, block, x, delta_real, delta_imag, propagate):
+        if delta_imag is None and not self._complex_params:
+            result = batched_res_sum_vjp(block, x, delta_real, propagate, self.state.max_parallel)
+            if result is not None:
+                jac, upstream = result
+                return jac.to(self.state.dtype), upstream, None
         params = _active_params(block)
 
         def backward_one(x, real, imag=None):
@@ -150,7 +156,7 @@ class MinSR(TDVP):
         centered = self._center_jacobian(jac, weight)
         return _stack_components(centered) if self.vs_type == 2 else centered
 
-    def get_Tmat(self, samples):
+    def get_Tmat(self, samples, *, _blocks=None):
         size = samples.nsamples * (2 if self.vs_type == 2 else 1)
         dtype = samples.wave_function.real.dtype if self.vs_type == 2 else self.state.dtype
         T = torch.zeros((size, size), device=self.state.device, dtype=dtype)
@@ -163,6 +169,8 @@ class MinSR(TDVP):
             if i % world == rank:
                 block = self._normalized_block(jac, samples.reweight_factor)
                 T.addmm_(block, block.mH)
+                if _blocks is not None:
+                    _blocks.append(block)
         if not means:
             raise ValueError("MinSR requires trainable parameters.")
         if group is not None:
@@ -200,6 +208,19 @@ class MinSR(TDVP):
     def get_step(self, samples):
         samples = self._gather_samples(samples)
         Ebar = self.get_Ebar(samples)
-        T = self.get_Tmat(samples)
-        step = self.solve(samples, T, Ebar)
+        # The small unprojected CUDA case can retain normalized derivatives
+        # and avoid the second pass. Cap their size so larger problems still
+        # get the original memory-bounded two-pass algorithm.
+        if (
+            type(self) is MinSR and self.process_group is None and self.state.device.type == "cuda"
+            and self.state.nsymm == 1 and self.vs_type == 0 and not self._complex_params
+            and samples.nsamples * self.state.nparams * Ebar.element_size() <= 320 * 2**20
+        ):
+            blocks = []
+            T = self.get_Tmat(samples, _blocks=blocks)
+            v = self._solve(T, Ebar)
+            step = torch.cat([block.mH @ v for block in reversed(blocks)])
+        else:
+            T = self.get_Tmat(samples)
+            step = self.solve(samples, T, Ebar)
         return self.build_step(step, self._Omean, self.energy)

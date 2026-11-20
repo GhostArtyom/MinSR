@@ -94,7 +94,7 @@ class Variational(State):
         batch = len(spins) if self.max_parallel is None else self.max_parallel // self.nsymm
         psi = torch.cat([self._raw(s) for s in spins.split(batch)]).reshape(shape)
         maximum = psi.abs().amax().to(self._maximum.dtype)
-        self._maximum = torch.where(maximum.isfinite(), torch.maximum(maximum, self._maximum), self._maximum)
+        self._maximum.copy_(torch.where(maximum.isfinite(), torch.maximum(maximum, self._maximum), self._maximum))
         return psi
 
     @torch.no_grad()
