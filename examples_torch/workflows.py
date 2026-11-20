@@ -9,9 +9,24 @@ import matplotlib.pyplot as plt
 import torch
 
 import quantax_torch as qtx
+from quantax_torch.nn._cuda_support import supports_tuned_kernels
 from quantax_torch.utils import (
     DataTracer, close_run, create_run, log_devices, log_progress, save_training_plots, setup_plot_font,
 )
+
+
+def _cuda_inference(config, device, symmetric):
+    # On the tested device, even 2×2 kernels benefit from avoiding periodic
+    # padding across a range of widths. Larger kernels still use the regular
+    # channel tiles; leave other ordinary shapes to channels-last cuDNN.
+    plain_shape = ((config.kernel_size == 2 and 8 <= config.channels <= 64)
+                   or (config.kernel_size >= 3 and config.channels % 16 == 0))
+    enabled = config.projected_periodic_conv if symmetric else (config.ordinary_periodic_conv and plain_shape)
+    if enabled and supports_tuned_kernels(device):
+        from quantax_torch.nn._periodic_cuda import res_sum_forward
+
+        return res_sum_forward
+    return None
 
 
 def _system(config, symmetric, checkpoint=None):
@@ -23,14 +38,25 @@ def _system(config, symmetric, checkpoint=None):
         torch.backends.cudnn.conv.fp32_precision = "ieee"
     qtx.set_random_seed(config.seed)
     qtx.sites.Square(config.L)
-    hamiltonian = qtx.operator.Heisenberg(J=[config.J1, config.J2], n_neighbor=[1, 2], msr=True)
+    inference = _cuda_inference(config, device, symmetric)
+    hamiltonian = qtx.operator.Heisenberg(
+        J=[config.J1, config.J2], n_neighbor=[1, 2], msr=True,
+        local_energy_graph=symmetric and inference is not None and config.projected_local_energy_graph,
+    )
     symm = qtx.symmetry.TotalSz()
     if symmetric:
         symm += qtx.symmetry.SpinInverse() + qtx.symmetry.C4v()
     net = qtx.nn.ResSum(**config.network)
     if device.type == "cuda" and not symmetric:
         net.to(memory_format=torch.channels_last)
-    state = qtx.state.Variational(net, symm=symm, max_parallel=config.max_parallel, device=device)
+    if symmetric and device.type == "cuda":
+        inference_batch = config.projected_forward_batch
+    else:
+        inference_batch = 2048 if inference is not None else None
+    state = qtx.state.Variational(
+        net, symm=symm, max_parallel=config.max_parallel, device=device, inference_batch=inference_batch,
+        inference_fn=inference,
+    )
     if checkpoint is not None:
         if checkpoint.suffix == ".eqx":
             qtx.state.load_res_sum_eqx(checkpoint, net)
@@ -57,6 +83,10 @@ def _header(logger, config, state, steps, thermal, sweep, symmetric, reweight, c
     logger.info("Steps=%d | samples=%d | max_parallel=%d | reweight=%g",
                 steps, config.nsamples, config.max_parallel, reweight)
     logger.info("Sampling: thermal_steps=%d | sweep_steps=%d", thermal, sweep)
+    if state.inference_batch is not None:
+        logger.info("CUDA inference batch: %d network inputs including orbit members", state.forward_batch)
+    if state.inference_fn is not None:
+        logger.info("CUDA forward: IEEE FP32 periodic convolution with fused operations where supported")
     logger.info("Network: ResSum %s", config.network)
     logger.info("Symmetry: %s", _sector(symmetric))
     logger.info("PyTorch %s | seed=%d", torch.__version__, config.seed)
@@ -68,7 +98,8 @@ def _header(logger, config, state, steps, thermal, sweep, symmetric, reweight, c
 def _sampler(config, state, reweight, thermal, sweep):
     return qtx.sampler.NeighborExchange(
         state, config.nsamples, reweight=reweight, n_neighbor=[1, 2], thermal_steps=thermal, sweep_steps=sweep,
-        cuda_graph=state.nsymm == 1,
+        cuda_graph=state.nsymm == 1 or config.projected_exchange_graph,
+        skip_unchanged=state.device.type == "cuda" and state.nsymm > 1,
     )
 
 
@@ -76,7 +107,7 @@ def train(config, *, steps, param_file=None, symmetric=False, thermal_steps=None
     if steps < 1:
         raise ValueError("steps must be positive.")
     if symmetric and param_file is None:
-        raise ValueError("Symmetry continuation requires --param-file.")
+        raise ValueError("Symmetry-projected training requires --param-file.")
     checkpoint = None if param_file is None else _checkpoint(param_file)
     thermal, sweep = config.sampling(thermal_steps, sweep_steps)
     suffix = "_symm" if symmetric else ""
@@ -98,6 +129,8 @@ def train(config, *, steps, param_file=None, symmetric=False, thermal_steps=None
         for n in range(1, steps + 1):
             step_start = perf_counter()
             samples = sampler.sweep()
+            if n == 1 and sampler._compact_key is not None:
+                logger.info("CUDA sampling: compacted exchange graph replay")
             update = optimizer.get_step(samples)
             if not bool(update.isfinite().all()):
                 raise FloatingPointError(f"Non-finite update at step {n}.")
@@ -105,7 +138,8 @@ def train(config, *, steps, param_file=None, symmetric=False, thermal_steps=None
             energy, variance = optimizer.energy.item(), optimizer.VarE.item()
             energies.append(energy)
             variances.append(variance)
-            if n % 10 == 0 or n == steps:
+            plot_every = 10 if n <= 100 else 100
+            if n % plot_every == 0 or n == steps:
                 save_training_plots(energies, variances, run, title, n, baseline=baseline, suffix=suffix)
             if n % 100 == 0 or n == steps:
                 state.save(run / f"params{suffix}_{n}.pt", metadata={
@@ -156,6 +190,9 @@ def measure(config, *, steps, param_file, preset=None, thermal_steps=None, sweep
             "system": config.system, "network_idx": preset, "network": config.network,
             "param_file": str(checkpoint), "symmetry": _sector(True),
             "nsamples": config.nsamples, "steps": steps, "max_parallel": config.max_parallel,
+            "inference_batch": state.forward_batch,
+            "projected_periodic_conv": state.inference_fn is not None,
+            "projected_exchange_graph": sampler._compact_key is not None,
             "thermal_steps": thermal, "sweep_steps": sweep,
             "energy": mean_energy, "energy_per_site": mean_energy / config.L**2, "variance": mean_variance,
             "seconds": perf_counter() - start, "seed": config.seed, "device": str(state.device),

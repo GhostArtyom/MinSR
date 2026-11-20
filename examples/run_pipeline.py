@@ -14,7 +14,7 @@ COMMON = {
     "J1": 1.0,
     "J2": 0.5,
     "DEPTH": 16,
-    "CHANNELS": 32,
+    "CHANNELS": 16,
     "KERNEL_SIZE": 3,
     "USE_SINH": True,
     "NSAMPLES": 1000,  # 10000

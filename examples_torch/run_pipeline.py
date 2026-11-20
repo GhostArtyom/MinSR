@@ -1,4 +1,4 @@
-"""Run the PyTorch training, symmetry continuation and measurement in separate processes."""
+"""Run the PyTorch training, symmetry-projected training and measurement in separate processes."""
 
 import argparse
 import importlib
@@ -32,6 +32,11 @@ class Config:
     nsamples: int = 1000
     step_size: float = 1e-3
     max_parallel: int = 32768
+    projected_forward_batch: int = 1024  # CUDA inference only; counts orbit members.
+    projected_periodic_conv: bool = True  # IEEE FP32 periodic convolution on supported CUDA GPUs.
+    projected_local_energy_graph: bool = True  # Replay full batches of connected configurations.
+    projected_exchange_graph: bool = True  # Replay compacted CUDA exchange proposals.
+    ordinary_periodic_conv: bool = True  # For supported CUDA shapes; does not change the backward pass.
     jacobian_batch: int = 8
     seed: int = 2347
     device: str = "cuda"
@@ -42,7 +47,8 @@ class Config:
             raise ValueError("This square-lattice example needs an even L with L >= 2.")
         if self.depth < 2 or self.depth % 2:
             raise ValueError("depth must be positive and even.")
-        if min(self.channels, self.kernel_size, self.nsamples, self.max_parallel, self.jacobian_batch) < 1:
+        if min(self.channels, self.kernel_size, self.nsamples, self.max_parallel,
+               self.projected_forward_batch, self.jacobian_batch) < 1:
             raise ValueError("Network and batch sizes must be positive.")
         if not all(math.isfinite(x) for x in (self.J1, self.J2, self.step_size)) or self.step_size <= 0:
             raise ValueError("The couplings must be finite and step_size must be finite and positive.")
@@ -79,11 +85,20 @@ PRESETS = {
 def add_common_options(parser):
     defaults = Config()
     for name in ("L", "J1", "J2", "depth", "channels", "kernel_size", "nsamples",
-                 "step_size", "max_parallel", "jacobian_batch", "seed", "device", "output_dir"):
+                 "step_size", "max_parallel", "projected_forward_batch", "jacobian_batch",
+                 "seed", "device", "output_dir"):
         value = getattr(defaults, name)
         kind = Path if isinstance(value, Path) else type(value)
         flag = name.lower().replace("_", "-")
         parser.add_argument(f"--{flag}", dest=name, type=kind, default=value)
+    parser.add_argument("--projected-periodic-conv", action=argparse.BooleanOptionalAction,
+                        default=defaults.projected_periodic_conv)
+    parser.add_argument("--projected-local-energy-graph", action=argparse.BooleanOptionalAction,
+                        default=defaults.projected_local_energy_graph)
+    parser.add_argument("--projected-exchange-graph", action=argparse.BooleanOptionalAction,
+                        default=defaults.projected_exchange_graph)
+    parser.add_argument("--ordinary-periodic-conv", action=argparse.BooleanOptionalAction,
+                        default=defaults.ordinary_periodic_conv)
     parser.add_argument("--use-sinh", action=argparse.BooleanOptionalAction, default=defaults.use_sinh)
 
 

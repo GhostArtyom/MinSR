@@ -1,10 +1,10 @@
-# 5 个教程分别教什么
+# MinSR 教程指南
 
 这组 Notebook 按“建立小系统基准、使用卷积网络、学习符号、处理复振幅、选择激发态扇区”的顺序展开。教程 2、3、5 使用 4×4 方格，教程 4 使用 6×6 三角格，教程 1 使用 12 个格点的链；未另行指定时采用周期边界。
 
-5 个教程都使用 `TDVP` 做虚时间优化；第 1 个还展示 `TDVP_exact`。想看 `MinSR` 类如何训练较深网络，应在读完教程后查看 [examples/train.py](../examples/train.py)。算法和代码之间的关系见[项目分析](project-overview.md)。
+5 个教程都使用 `TDVP` 做虚时间优化；第 1 个还展示 `TDVP_exact`。想看 `MinSR` 类如何训练较深网络，应在读完教程后查看 [examples/train.py](../examples/train.py)。算法和代码之间的关系见[项目概览](project-overview.md)。
 
-## 直接运行 Python 脚本
+## Python 脚本运行方式
 
 [examples/train_tutorial.py](../examples/train_tutorial.py) 把 5 个教程的训练流程放进一个脚本。开头设置 `TUTORIAL` 为 `ising`、`heisenberg`、`j1j2`、`triangular` 或 `excited`，再修改 `PRESETS` 中对应教程的字典；默认运行 4×4 的 J1-J2 模型。构型、耦合、对称性、网络和分阶段训练设置都放在预设内，采样、精度、保存和 ED 设置放在其后的共用参数区。每类参数都有中文注释；“从所选预设读取参数”以下的代码通常无需修改。原 Notebook 保持不变。
 
@@ -51,7 +51,7 @@
 | [4-Triangular](../tutorials/4-Triangular.ipynb) | 6×6 三角格，$J_1=1$、$J_2=0.125$ | 实参数复输出、120° Néel 相位先验、三角格点群 | 对称化前后各优化 200 次，跟踪能量和方差 |
 | [5-ExcitedState](../tutorials/5-ExcitedState.ipynb) | 4×4 方格，$J_1=1$、$J_2=0.5$ | CNN 非零动量、自旋反演奇扇区 | 两阶段各优化 200 次，末尾在指定外部对称扇区做精确对角化 |
 
-## 1. Ising：从精确解理解一次变分训练
+## 1. Ising：变分训练与精确解对照
 
 [第 1 个教程](../tutorials/1-Ising.ipynb) 先设置随机种子 2347、默认计算类型 `float64` 和网络参数类型 `float32`，然后创建 `Chain(12)`。这一步介绍了 Quantax 的使用约定：晶格是隐式传给后续对象的全局常量，必须先创建。
 
@@ -87,7 +87,7 @@ $$
 
 末尾精确对角化时，教程显式使用 `full_symm = symm + Trans2D()`，让基准基底也包含网络中已编码的平移约束。本节要理解的是：网络结构能编码部分对称性，外部投影能进一步限制搜索空间；投影后仍可继续优化权重。
 
-## 3. J1-J2：让实网络学习正负号
+## 3. J1-J2：实值网络的符号表示
 
 [第 3 个教程](../tutorials/3-J1J2.ipynb) 保留上一节的方格、网络规模和两阶段训练结构，把哈密顿量改为：
 
@@ -128,7 +128,7 @@ state = TotalSz()(state * sign_net)
 
 读完这一节，应能区分“复数计算类型”“复数网络参数”和“复数波函数输出”，并能沿着 `state * sign_net` 追踪网络输出如何与固定相位函数组合。
 
-## 5. ExcitedState：用对称性选出低能激发态
+## 5. ExcitedState：对称扇区中的低能激发态
 
 [第 5 个教程](../tutorials/5-ExcitedState.ipynb) 回到 4×4 方格的 $J_1=1$、$J_2=0.5$ 模型，仍使用 `use_sinh=True`。它把非零平移动量直接传给 CNN 的末端求和：
 

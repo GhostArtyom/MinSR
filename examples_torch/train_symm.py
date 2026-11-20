@@ -12,7 +12,7 @@ def main(param_file, config=None, *, steps=1000, thermal_steps=None, sweep_steps
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Continue MinSR training with symmetry projection.")
+    parser = argparse.ArgumentParser(description="Run MinSR training with symmetry projection from an initial checkpoint.")
     add_common_options(parser)
     add_sampling_options(parser)
     parser.add_argument("--param-file", type=Path, required=True)

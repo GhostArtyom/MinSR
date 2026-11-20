@@ -19,12 +19,17 @@ class ResBlock(nn.Module):
                           use_bias=nblock != total_blocks - 1)
         self.nblock = nblock
 
-    def forward(self, x):
-        scale = math.sqrt(2 if self.nblock == 0 else self.nblock + 1)
-        y = x / scale
+    @property
+    def _input_scale(self):
+        return math.sqrt(2 if self.nblock == 0 else self.nblock + 1)
+
+    def forward(self, x, *, convolve=None):
+        y = x / self._input_scale
         if self.nblock > 0:
             y = y.relu()
-        return x + self.conv2(self.conv1(y).relu())
+        if convolve is None:
+            return x + self.conv2(self.conv1(y).relu())
+        return convolve(self.conv2, convolve(self.conv1, y, relu=True), residual=x)
 
 
 def ResSum(depth, channels, kernel_size, use_sinh=False, trans_symm=None):

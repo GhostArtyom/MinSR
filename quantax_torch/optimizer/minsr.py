@@ -1,14 +1,29 @@
 import math
+from itertools import islice
 
 import torch
 from torch import distributed
 from torch.func import functional_call, vjp, vmap
 
+from ._cuda_gram import add_gram_lower_
 from ._res_sum import batched_res_sum_vjp
 from .solver import minsr_pinv_eig
 from .tdvp import TDVP, _stack_components
 from ..nn import Sequential
 from ..sampler import Samples
+
+
+_DERIVATIVE_CACHE_BYTES = 320 * 2**20
+
+
+def _gram_tile(T):
+    # On the tested consumer CUDA architecture, FP64 GEMM is expensive
+    # enough to benefit from not computing both halves of a large Gram.
+    n = T.shape[0]
+    if (512 <= n <= 4096 and T.dtype == torch.float64 and T.is_cuda and torch.version.cuda is not None
+            and torch.cuda.get_device_capability(T.device) == (12, 0)):
+        return 128 if n <= 1024 else 256
+    return 0
 
 
 def _active_params(module):
@@ -42,7 +57,7 @@ def _on_orbits(module, x, params=None):
 
 
 class MinSR(TDVP):
-    """Compute the sample Gram matrix and the step in two passes over parameter blocks."""
+    """Compute the sample Gram matrix and step over parameter blocks."""
 
     def __init__(self, state, hamiltonian, solver=None, *, jacobian_batch=8, process_group=None):
         super().__init__(state, hamiltonian, solver=minsr_pinv_eig() if solver is None else solver)
@@ -112,7 +127,7 @@ class MinSR(TDVP):
             result = batched_res_sum_vjp(block, x, delta_real, propagate, self.state.max_parallel)
             if result is not None:
                 jac, upstream = result
-                return jac.to(self.state.dtype), upstream, None
+                return jac, upstream, None
         params = _active_params(block)
 
         def backward_one(x, real, imag=None):
@@ -134,12 +149,11 @@ class MinSR(TDVP):
         batched = vmap(backward_one, chunk_size=self.jacobian_batch)
         if delta_imag is None:
             jac, real = batched(x, delta_real)
-            return jac.to(self.state.dtype), real, None
+            return jac, real, None
         jac, real, imag = batched(x, delta_real, delta_imag)
-        return jac.to(self.state.dtype), real, imag
+        return jac, real, imag
 
-    def jacobian_blocks(self, spins):
-        """Yield block indices and logarithmic derivatives in reverse network order."""
+    def _native_jacobian_blocks(self, spins):
         spins = torch.as_tensor(spins, device=self.state.device)
         positions, real, imag = self._prepare(spins)
         block_index = sum(len(blocks) for _, blocks, _ in self._layers)
@@ -152,11 +166,16 @@ class MinSR(TDVP):
                 jac, r, im = self._block_vjp(blocks[j], positions[i][j], r, im, propagate=j > 0)
                 yield block_index, jac
 
+    def jacobian_blocks(self, spins):
+        """Yield state-dtype logarithmic derivatives in reverse network order."""
+        for i, jac in self._native_jacobian_blocks(spins):
+            yield i, jac.to(self.state.dtype)
+
     def _normalized_block(self, jac, weight):
         centered = self._center_jacobian(jac, weight)
         return _stack_components(centered) if self.vs_type == 2 else centered
 
-    def get_Tmat(self, samples, *, _blocks=None):
+    def get_Tmat(self, samples, *, _blocks=None, _native_cache=False, _retain_before=None):
         size = samples.nsamples * (2 if self.vs_type == 2 else 1)
         dtype = samples.wave_function.real.dtype if self.vs_type == 2 else self.state.dtype
         T = torch.zeros((size, size), device=self.state.device, dtype=dtype)
@@ -164,27 +183,53 @@ class MinSR(TDVP):
         group = self.process_group
         rank = 0 if group is None else distributed.get_rank(group)
         world = 1 if group is None else distributed.get_world_size(group)
-        for i, jac in self.jacobian_blocks(samples.spins):
+        tile = _gram_tile(T) if group is None and self.vs_type == 0 else 0
+        mirror = False
+        lower_only = False
+        blocks = self._native_jacobian_blocks if _native_cache else self.jacobian_blocks
+        for i, raw in blocks(samples.spins):
+            jac = raw.to(self.state.dtype) if _native_cache else raw
             means.append((jac * samples.reweight_factor[:, None]).mean(dim=0))
             if i % world == rank:
                 block = self._normalized_block(jac, samples.reweight_factor)
-                T.addmm_(block, block.mH)
-                if _blocks is not None:
-                    _blocks.append(block)
+                if tile and block.shape[1] >= 4096:
+                    if 512 <= size <= 1024 and add_gram_lower_(T, block):
+                        lower_only = True
+                    else:
+                        # Below-diagonal tile columns plus full diagonal tiles.
+                        for start in range(0, size, tile):
+                            end = min(start + tile, size)
+                            T[start:, start:end].addmm_(block[start:], block[start:end].mT)
+                        mirror = True
+                else:
+                    T.addmm_(block, block.mH)
+                if _blocks is not None and (_retain_before is None or i < _retain_before):
+                    _blocks.append(raw if _native_cache else block)
         if not means:
             raise ValueError("MinSR requires trainable parameters.")
+        if lower_only:
+            T = T.tril() + T.tril(-1).mT
+        elif mirror:
+            # Reconstruct the missing off-diagonal tiles in-place, including
+            # contributions from small blocks accumulated with full GEMMs.
+            for start in range(tile, size, tile):
+                end = min(start + tile, size)
+                T[:start, start:end].copy_(T[start:end, :start].mT)
         if group is not None:
             distributed.all_reduce(T, group=group)
         self._Omean = torch.cat(means[::-1])
         return T
 
-    def Ohvp(self, samples, v):
+    def _adjoint_blocks(self, samples, v, limit=None):
         blocks = []
         weight = samples.reweight_factor
-        for _, jac in self.jacobian_blocks(samples.spins):
+        for _, jac in islice(self.jacobian_blocks(samples.spins), limit):
             block = self._normalized_block(jac, weight)
             blocks.append(block.mH @ v)
-        return torch.cat(blocks[::-1])
+        return blocks[::-1]
+
+    def Ohvp(self, samples, v):
+        return torch.cat(self._adjoint_blocks(samples, v))
 
     def solve(self, samples, Tmat, Ebar):
         rhs = _stack_components(Ebar) if self.vs_type == 2 else Ebar
@@ -204,23 +249,56 @@ class MinSR(TDVP):
         weights = gather(samples._unnormalized_weight)
         return Samples(gather(samples.spins), gather(samples.wave_function), weights / weights.mean())
 
+    def _cache_plan(self, samples, element_size):
+        if (type(self) is not MinSR or self.process_group is not None or self.state.device.type != "cuda"
+                or self.vs_type != 0 or self._complex_params):
+            return None, None
+        params = tuple(self.state.parameters())
+        elements = samples.nsamples * sum(p.numel() for p in params)
+        budget = _DERIVATIVE_CACHE_BYTES
+        if elements * element_size <= budget:
+            return "normalized", None
+        if self.state.dtype != torch.float64 or not all(p.dtype == torch.float32 for p in params):
+            return None, None
+        if elements * 4 <= budget:
+            return "native", None
+
+        # Prefer the input-side prefix: the second pass can then stop before
+        # those layers, avoiding their input as well as weight gradients.
+        retained = 0
+        for _, blocks, _ in self._layers:
+            for block in blocks:
+                budget -= samples.nsamples * 4 * sum(p.numel() for p in block.parameters() if p.requires_grad)
+                if budget < 0:
+                    return ("native", retained) if retained else (None, None)
+                retained += 1
+        return "native", None
+
     @torch.no_grad()
     def get_step(self, samples):
         samples = self._gather_samples(samples)
         Ebar = self.get_Ebar(samples)
-        # The small unprojected CUDA case can retain normalized derivatives
-        # and avoid the second pass. Cap their size so larger problems still
-        # get the original memory-bounded two-pass algorithm.
-        if (
-            type(self) is MinSR and self.process_group is None and self.state.device.type == "cuda"
-            and self.state.nsymm == 1 and self.vs_type == 0 and not self._complex_params
-            and samples.nsamples * self.state.nparams * Ebar.element_size() <= 320 * 2**20
-        ):
-            blocks = []
-            T = self.get_Tmat(samples, _blocks=blocks)
-            v = self._solve(T, Ebar)
-            step = torch.cat([block.mH @ v for block in reversed(blocks)])
-        else:
+        cache, retain_before = self._cache_plan(samples, Ebar.element_size())
+        if cache is None:
             T = self.get_Tmat(samples)
             step = self.solve(samples, T, Ebar)
+        else:
+            blocks = []
+            native = cache == "native"
+            T = self.get_Tmat(samples, _blocks=blocks, _native_cache=native, _retain_before=retain_before)
+            v = self._solve(T, Ebar)
+            step_blocks = []
+            while blocks:
+                block = blocks.pop()
+                if native:
+                    # The usual VJP already produced FP32 derivatives. Only
+                    # the centering and solve use FP64; redo the centering at
+                    # that precision instead of saving a promoted tensor.
+                    block = self._normalized_block(block.to(self.state.dtype), samples.reweight_factor)
+                step_blocks.append(block.mH @ v)
+                del block
+            if retain_before is not None:
+                total_blocks = sum(len(blocks) for _, blocks, _ in self._layers)
+                step_blocks.extend(self._adjoint_blocks(samples, v, total_blocks - retain_before))
+            step = torch.cat(step_blocks)
         return self.build_step(step, self._Omean, self.energy)

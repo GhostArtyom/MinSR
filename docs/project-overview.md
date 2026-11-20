@@ -1,6 +1,6 @@
-# MinSR 项目分析
+# MinSR 项目概览
 
-## 项目做了什么
+## 项目定位与适用范围
 
 MinSR 是论文 *Empowering deep neural quantum states through efficient optimization* 的配套仓库。它用神经量子态（Neural Quantum State，NQS）近似量子多体波函数，并提供一套从晶格建模、对称性约束、蒙特卡洛采样到参数优化和能量测量的实现。项目背景和论文入口见根目录的 [README](../README.md)。
 
@@ -8,7 +8,7 @@ MinSR 是论文 *Empowering deep neural quantum states through efficient optimiz
 
 仓库名称是 MinSR，实际导入的 Python 包名是 `quantax`。MinSR 是其中的优化算法；Quantax 还负责晶格、算符、量子态、网络、对称性和采样。根目录说明将其定位为论文所用的历史版本源码，使用和修改时应以本仓库接口为准。
 
-## 计算怎样完成
+## 变分能量与训练流程
 
 设自旋构型为 $s=(s_1,\ldots,s_N)$，其中 $s_i\in\{-1,1\}$。网络参数为 $\theta$，输出为 $\psi_\theta(s)$。目标是最小化归一化后的能量期望：
 
@@ -43,7 +43,7 @@ state.update(step * 1e-3)
 
 `get_step` 计算方向，`update` 执行参数更新。后者内部已经处理了更新方向的负号和整体波函数尺度，照示例传入正的步长系数即可。`optimizer.energy` 和 `optimizer.VarE` 来自这次 `get_step` 使用的样本，对应本轮更新前的状态。
 
-## MinSR 改进了哪一步
+## MinSR 的样本空间求解
 
 随机重构（Stochastic Reconfiguration，SR）根据波函数在参数空间中的几何结构选择更新方向。本仓库的 `TDVP` 默认执行虚时间优化，用来降低能量；`TDVP_exact` 用完整基底上的波函数计算对应更新，适合小系统检查。
 
@@ -75,27 +75,27 @@ $$
 
 上述矩阵尺寸说明针对实数情形。实参数、复输出时，实现会拼接实部和虚部，样本空间维度变为 $2N_s$。`MinSR` 明确拒绝非全纯复参数态（`vs_type == 1`），对实参数、复输出的网络也要求复数中间量只出现在末尾的无参数层中。
 
-## 网络、对称性和采样各自负责什么
+## 网络、对称性与采样
 
-### 网络表示振幅和符号
+### 波函数的网络表示
 
 教程 1 使用全连接受限玻尔兹曼机 `RBM_Dense`，其余教程使用残差卷积网络 `ResSum`。`ResSum(depth, channels, kernel_size)` 的前三个参数分别指定卷积层数、通道数和卷积核大小，`depth` 必须是偶数。卷积采用周期填充，末端通过空间求和或带平移特征标的求和生成波函数振幅。
 
 默认实数设置下，`ResSum` 的指数输出给出正振幅。`use_sinh=True` 将末端激活改为带整体尺度的 $\sinh(x)+1$，使实输出可以变号。三角格教程则将默认计算类型设为复数，网络把实通道配成复数后输出复振幅；网络参数仍为实数。实现见 [sum_nets.py](../quantax/nn/sum_nets.py) 和 [activation.py](../quantax/nn/activation.py)。
 
-### 对称性限制搜索空间
+### 对称性约束
 
 `TotalSz()` 指定总磁化为零的子空间，`SpinInverse()` 指定自旋反演偶扇区，`SpinInverse(-1)` 指定奇扇区。`Trans1D`、`Trans2D` 指定平移动量扇区，`C4v` 和 `D6` 分别用于方格和三角格点群。`+` 用来组合这些约束。
 
 空间对称性和自旋反演通过对变换后的构型求值并加权平均来投影波函数。固定总磁化则还依赖基底和采样器：`TotalSz` 决定精确基底中的上自旋数，交换采样在该磁化扇区内移动。默认零动量的 `ResSum` 已通过周期卷积和末端求和编码平移对称性，因此教程 2、3 在变分态外部只增加自旋反演和点群投影。实现见 [symmetry.py](../quantax/symmetry/symmetry.py) 和 [nqs_layers.py](../quantax/nn/nqs_layers.py)。
 
-### 采样器决定怎样探索构型
+### 构型采样
 
 Ising 模型含单自旋翻转项，教程使用 `LocalFlip`。Heisenberg 类模型的教程固定总磁化，使用交换两个格点自旋的 `NeighborExchange`。参数 `n_neighbor=[1, 2]` 允许在第一、第二近邻键上提出交换，不会改变哈密顿量本身。
 
 默认 `reweight=2.0` 按 $|\psi|^2$ 采样。大规模训练示例改用 `reweight=1.0`，按 $|\psi|$ 采样，并通过 `Samples.reweight_factor` 把统计量重加权回目标分布。训练脚本的注释标明，该设置仅用于不超过 100 个格点的系统。实现见 [metropolis.py](../quantax/sampler/metropolis.py) 和 [status.py](../quantax/sampler/status.py)。
 
-## 代码和材料放在哪里
+## 仓库结构
 
 | 路径 | 职责或材料 |
 | --- | --- |
@@ -116,7 +116,7 @@ Ising 模型含单自旋翻转项，教程使用 `LocalFlip`。Heisenberg 类模
 
 JAX 负责自动微分、编译和设备计算，Equinox 负责网络模块和参数序列化，QuSpin 负责自旋基底、算符作用和精确对角化。仓库支持同一节点上的多设备计算；根目录说明仍将多节点兼容列为待实现内容。
 
-## 从教程到论文规模示例
+## 训练与测量示例
 
 只需修改 [run_pipeline.py](../examples/run_pipeline.py) 开头的配置区：`COMMON` 设置共用的晶格、网络、`NSAMPLES` 等参数，其中 `STEP_SIZE` 只用于两个训练阶段；`STAGES` 设置各阶段的 `STEPS` 等参数，也可在某个阶段单独覆盖 `NSAMPLES`。从仓库根目录直接运行，不用传参：
 
@@ -148,7 +148,7 @@ JAX 负责自动微分、编译和设备计算，Equinox 负责网络模块和�
 
 测量脚本的注释将这些网络对应到论文图 2b 中的 ResNet2（MinSR）结果。`.eqx` 文件保存网络权重，加载时仍须创建匹配的网络结构。单独运行时若未传 `--param-file`，则读取表中自带权重；若已修改共用的晶格尺寸、卷积核或输出层设置，使用自带权重前要恢复与预设匹配的设置。`THERMAL_STEPS` 和 `SWEEP_STEPS` 分别控制初始化热化和每轮采样的更新次数，默认按实际使用的晶格尺寸取 $100L^2$ 和 $10L^2$，也可分别覆盖。每次运行创建独立的 `runs/<体系和格点名>/<运行时间>/`，`measurement.log` 开头记录运行配置和权重来源，随后记录累计平均能量、累计方差、完成步数与耗时；`measurement.csv` 逐轮保存能量、局域能量二阶矩、累计平均能量和累计方差，并立即刷新；`summary.json` 保存最终测量结果和权重来源。中断时保留已写入的 CSV，不生成最终汇总。
 
-## 读数和运行时需要核对的约定
+## 数值约定与运行限制
 
 论文图 2b 与复现结果的对比见[复现记录](reproduction-results.md)，其中汇总了两个训练阶段和测量结果，并列给出每格点能量 $E_{\mathrm{spin}}/N$ 和总能量 $E_{\mathrm{Pauli}}$。
 

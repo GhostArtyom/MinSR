@@ -1,82 +1,59 @@
-# MinSR 的 PyTorch 移植计划
+# MinSR 的 PyTorch 移植说明
 
-## 1. 目标和范围
+[`quantax_torch/`](../quantax_torch/) 是本仓库 `quantax` 的 PyTorch 实现。[`examples_torch/`](../examples_torch/) 的普通训练、对称性训练和固定权重测量可以独立运行，也可以由 `run_pipeline` 串起来。原来的 JAX 入口继续保留。三阶段已通过短测；当前优化版尚未完成全程统计验收。[JAX 与 PyTorch 耗时对比](implementation-improvements.md#jax-与-pytorch-耗时对比)
 
-以本仓库的 `quantax` 为行为基准，移植晶格、对称性、网络、自旋态、算符、采样器、优化器和设备计算。首期的端到端验收是 `examples_torch/` 下的 `train.py`、`train_symm.py`、`measure.py` 三个入口既可独立运行，又能由同目录的 `run_pipeline.py` 串接。现有 `examples/` 原样保留，作为 JAX 行为基准。对同一权重和输入要求数值一致，对独立训练和采样要求关键统计量接近归档结果。五个教程用于覆盖主流程之外的已发布功能。
+## 安装和运行
 
-单步 Lanczos 修正、零方差外推、能隙拟合、结构因子和关联比属于后续论文实验。首期保留组合已有算符和态、注册观测量、替换求解器和配置对称扇区的接口。历史归档中的 Flax ResNet1、未随这个 checkout 发布的实验入口及参考数据列在后续范围。当前 `ResProd` 按本仓库实现移植。[项目总览](project-overview.md) · [教程指南](tutorial-guide.md) · [论文](Chen-2024-MinSR/paper.pdf)
+从仓库根目录执行。锁定环境为 Python 3.11、PyTorch 2.10.0/CUDA 12.8；用 `--device cpu` 可在 CPU 上运行。
 
-**执行约定。** 先用固定输入对照和独立入口的小规模 CPU 短测准备复核材料。现有 JAX 任务占用显卡期间，Torch 检查使用 CPU 并限制线程。流水线编排和失败路径通过替身阶段测试。完整 `run_pipeline` 及验收配置下的独立复测安排在用户复核之后。
+```bash
+uv sync --project environments/py311-torch --locked
+```
 
-## 2. 归档基准和验收配置
+常用配置都在 [`examples_torch/run_pipeline.py`](../examples_torch/run_pipeline.py) 开头，不需要单独的配置文件。`Config` 设置共享的晶格、网络和批量；`STAGES` 设置阶段长度，也可单独覆盖 `nsamples`、`max_parallel`、`thermal_steps` 和 `sweep_steps`。保持三阶段的晶格和网络一致。编辑后直接运行：
 
-### 2.1 运行配置
+```bash
+environments/py311-torch/.venv/bin/python -m examples_torch.run_pipeline
+```
 
-| 配置 | `train` | `train_symm` | `measure` |
-| --- | --- | --- | --- |
-| `NSAMPLES` | 1000 | 1000 | 1000 |
-| `STEPS` | 2000 | 1000 | 100 |
-| 初始权重 | 新初始化 | 普通训练的最终权重 | 对称性训练的最终权重 |
-| 对称扇区 | `TotalSz(0)` | `TotalSz(0) + SpinInverse() + C4v()` | 同 `train_symm` |
-| `reweight` | 1.0 | 1.0 | 2.0 |
-| 热化/每轮提议次数 | 2000/200 | 2000/200 | 10000/1000 |
-| 参数更新步长 | 0.001 | 0.001 | 测量期间冻结权重 |
+也可以用命令行指定设备、种子、样本数和三个阶段的长度：
 
-共用 10×10 周期方格、$J_1=1$、$J_2=0.5$、`msr=True`、`ResSum(16, 16, 3, use_sinh=True)`、`max_parallel=32768`，交换采样使用第一和第二近邻。两个训练阶段的热化/提议步数来自现有采样器默认值。验收配置中的 `STEPS=2000` 对应普通训练，并显式指定后两阶段的 `STEPS`，以匹配归档。[训练入口](../examples/train.py) · [对称性训练入口](../examples/train_symm.py) · [测量入口](../examples/measure.py) · [采样默认值](../quantax/sampler/metropolis.py)
+```bash
+environments/py311-torch/.venv/bin/python -m examples_torch.run_pipeline \
+  --device cuda --seed 2347 --nsamples 1000 \
+  --steps 2000 --symm-steps 1000 --measure-steps 100
+```
 
-### 2.2 已有结果
+默认体系是 10×10 周期方格，$J_1=1$、$J_2=0.5$，`msr=True`，`ResSum(16, 16, 3, use_sinh=True)`。每阶段 1000 个样本，`max_parallel=32768`，交换采样使用第一和第二近邻。
 
-目录均位于 `runs/j1j2_square_10x10_J1-1_J2-0.5/`。训练统计取各阶段最后 200 步的逐步日志均值，测量统计取对应的 `summary.json`。
+| 阶段 | 默认长度 | 对称扇区 | `reweight` | 热化 / 交换 | 参数步长 |
+| --- | ---: | --- | ---: | ---: | --- |
+| 普通训练 | 2000 步 | `TotalSz(0)` | 1.0 | 2000 / 200 | 0.001 |
+| 对称性训练 | 1000 步 | `TotalSz(0) + SpinInverse() + C4v()` | 1.0 | 2000 / 200 | 0.001 |
+| 测量 | 100 轮 | 同对称性训练 | 2.0 | 10000 / 1000 | 不更新 |
 
-| 对照 | 普通训练，末 200 步平均总能量/方差 | 对称性训练，末 200 步平均总能量/方差 | 测量，总能量/每格点能量/方差 |
-| --- | --- | --- | --- |
-| A，主基准 | `20261119_030050`，−198.08309 / 21.61546 | `20261119_051106`，−198.79243 / 7.52806 | `20261119_150209`，100 轮，−198.81543814 / −1.98815438 / 5.23723064 |
-| B，辅助对照 | `20261119_054229`，−197.61995 / 20.39306 | `20261119_063326`，−198.69231 / 6.21788 | `20261120_022539`，100 轮，−198.78751226 / −1.98787512 / 6.20959269 |
+普通训练默认从随机初始化开始。流水线为每个阶段启动独立进程，下一阶段读取上一阶段实际生成的最终权重并重新热化。阶段失败时停止。要从普通训练权重开始做对称性训练和测量，设置 `FROM_CHECKPOINT` 或传 `--from-checkpoint`，跳过普通训练。只跑对称性训练用 `examples_torch.train_symm --param-file`；只测量用 `examples_torch.measure --param-file`。测量也可用 `--network-idx` 选择三个内置预设 `1616`、`1632`、`3064`。
 
-主基准从普通训练最终的 `params_2000.eqx` 接到 `params_symm_1000.eqx`，然后测量。对称性训练 A 的日志记录的是归档重命名前的普通训练权重名，权重定位以对应目录现有归档为准。辅助对照 B 使用同一权重的 100 轮重测结果。另一个普通训练目录 `20261119_145505` 使用 10000 样本且中止，不计入完整对照。两组原始汇总和能量换算见[复现记录](reproduction-results.md#已完成的复现)。
+本仓库的 `ResSum` 可读取 Equinox `.eqx`。导入会检查参数和 buffer 的形状、dtype 及文件结尾，并导入 `theta0`。按 checkpoint 设置网络结构；Torch 新写出的 checkpoint 为带元数据和版本号的 `.pt`，默认最终文件为 `params_2000.pt` 和 `params_symm_1000.pt`。
 
-## 3. 代码布局和交付接口
+结果默认写到 `runs/torch/<system>/<timestamp>/`。训练保留 `training.log` 或 `training_symm.log`、PDF 和 checkpoint，每 100 步及最后一步存权重。测量写 `measurement.log` 和逐轮刷新的 `measurement.csv`，在最后一轮完成后才写 `summary.json`。日志记录配置、后端和设备、种子及输入权重路径。
 
-- **包与环境。** `quantax_torch/` 对应当前 `quantax/`。Torch 实现、示例和验收统一使用 Python 3.11，PyTorch 2.10.0/CUDA 12.8 锁定在 `environments/py311-torch/`。运行 `uv sync --project environments/py311-torch --locked` 建立该目录下的 `.venv/`。现有两套 JAX 环境用于对照。原包中的 JAX 转换协议以及 NetKet/jVMC 适配留在 JAX 侧。
-- **物理数据和设备。** 晶格坐标、邻接键、对称置换和字符由 NumPy 准备，批量波函数求值、采样和局域能量都在 Torch 张量上执行。三个示例入口可在无 QuSpin 环境中运行。稠密对称基底、精确对角化、精确采样和 `TDVP_exact` 仍通过可选的 QuSpin 接口执行。需要这些功能时，可在 Torch 环境安装 `--extra ed` 的辅助依赖及兼容目标机器的 `cp311` QuSpin wheel。现阶段使用已有 JAX 环境做对应的小系统对照。
-- **Torch 示例。** 根目录新增 `examples_torch/`，包含 `train.py`、`train_symm.py`、`measure.py` 和 `run_pipeline.py`，直接导入 `quantax_torch`。三阶段共享体系和网络配置，默认使用相同的样本数，可分别设置各阶段的迭代次数和采样配置。`train_symm.py` 接受 `--param-file`，测量提供对应的网络预设和显式 checkpoint 路径。日志记录实际配置、后端/设备、种子以及 checkpoint 来源。
-- **流水线。** 在 `examples_torch/run_pipeline.py` 开头编辑 `Config` 的公共默认值、`STAGES` 的阶段配置及 `FROM_CHECKPOINT`，然后运行 `python -m examples_torch.run_pipeline`。在 `STAGES` 中可为某一阶段覆盖 `nsamples`、`max_parallel`、`thermal_steps` 和 `sweep_steps`；保持晶格和网络配置一致。也可用命令行设置公共参数、覆盖各阶段的 `steps` 或指定 `--from-checkpoint`。流水线用独立子进程启动各阶段，将实际产物路径交给下一阶段，遇到错误立即停止。输出目录与 JAX 归档分开，只在最终测量完成后生成 `summary.json`，保留中断前已刷新的 CSV。
-- **权重格式。** 对本 checkout 的 `ResSum`，Torch 入口可直接读取 Equinox `.eqx` 的 NumPy 数组流，按对应模型的参数和 buffer 顺序导入，包括 `theta0`，同时核验叶子的形状、dtype 和文件结束位置。阶段间使用带元数据和版本号的 Torch `state_dict`，例如 `params_2000.pt` 和 `params_symm_1000.pt`，跨阶段重新热化。
-- **可扩展接口。** 沿用 `Variational` 的批量求值、`input_fn`/`output_fn` 和态组合；算符提供连接构型及矩阵元、$H\psi$、局域估计量和期望值接口；采样结果保留构型、振幅、重加权因子；优化器接受求解器回调和可遍历的导数块。后续 Lanczos 可组合 $\psi$ 和 $H\psi$，外推可消费能量/方差输出，自旋与二聚体观测量可复用通用算符。先用已存在的功能验证这些接口。
+### CUDA 开关
 
-## 4. 实施顺序
+可在 `Config` 设置，也可以用对应的 `--no-...` 选项单独关闭一个优化做对照。
 
-### 4.1 固定参考输入和小系统
+| 配置 | 用途 |
+| --- | --- |
+| `projected_forward_batch=1024` | 对称性训练和测量的前向批量，按展开后的对称轨道成员计数，同时受 `max_parallel` 限制。 |
+| `projected_periodic_conv` / `ordinary_periodic_conv` | 分别控制对称阶段和普通训练的专用周期卷积前向。 |
+| `projected_local_energy_graph` | 对称阶段的局域能量整批前向重放。 |
+| `projected_exchange_graph` | 对称阶段的压缩交换提议重放。 |
 
-1. 用仓库中的 JAX 实现生成参考，记录生成对照数据所用的依赖和设备版本。检查归档中的两个普通训练及两个对称性训练 checkpoint。为对照准备一批固定自旋构型、显式重加权因子和模型权重，先选 4×4 方格并覆盖有/无对称投影。
-2. 用原 JAX 导出小规模 CPU 参考值，包括候选/接受的构型、投影前后振幅、连接矩阵元、局域能量、重加权因子、对数导数、$T$、求解向量、参数步长和更新后的振幅。用固定的提议位置和均匀随机数验证采样分支，用各自的随机种子验证运行可追溯性。
-3. 建立 Ising、方格 Heisenberg、实输出 $J_1$-$J_2$、三角格复输出、非零动量激发态的小系统用例。用精确基底/对角化核对 Pauli 能量归一化、相位和对称扇区，避免只检查两个后端之间的差值。[原 JAX 小系统检查](../scripts/check_gpu.py) · [教程预设](../examples/train_tutorial.py)
+不满足专用内核的设备或形状要求时走通用路径。关闭专用周期卷积也会使依赖它的两条对称 CUDA Graph 路径回退；要只比较某一张图，用对应的开关。测量的 `summary.json` 记录实际前向批量、是否使用专用周期前向和是否启用压缩交换图。[内核覆盖范围与性能](implementation-improvements.md#pytorch-实现优化)
 
-### 4.2 先打通权重、局域能量和采样
+## 数值验收
 
-1. 移植 `sites`、`symmetry`、基础卷积/线性层、`ResSum`、`Variational`、`State`/`DenseState`。对照周期填充，特别检查偶数卷积核、输入格点排列、残差广播、动量字符、末端求和/平均和 `SinhShift` 的符号。注册 `theta0` 为持久 buffer，按照原实现单独更新。
-2. 在方格 $J_1$-$J_2$ 上核对每条键的对角项和交换项，保留 Pauli 归一化、`msr=True` 只改变第一近邻横向交换项和重复连接构型的累加语义。保留 QuSpin 小系统通用参考，Torch 快速路径按连接批次求值和归并，避免大系统中对每个连接逐一调用网络。
-3. 移植 `NeighborExchange` 和 `LocalFlip`，保留磁化守恒、链状态、热化、一轮提议次数和重加权。训练参数更新后的下一次 sweep 先用新参数刷新链上旧构型的振幅和接受概率。固定样本对照通过后，用归档 A 的对称权重验证 `measure` 的小规模运行及输出。
-4. 核对两个训练阶段均以更新前样本记录能量与中心方差。测量的第二个原始量为 $\langle|E_{\mathrm{loc}}|^2\rangle$，最终方差从累计二阶矩减去累计平均能量的平方得到。[算符与局域估计量](../quantax/operator/operator.py) · [采样状态](../quantax/sampler/status.py)
-
-### 4.3 移植 MinSR 及其数值约定
-
-1. 先实现小规模完整 Jacobian 参考路径。用 `torch.func.functional_call`、`vmap`、`jacrev` 或分开的实/虚部反传计算 $O_{sk}=\partial\psi_\theta(s)/\partial\theta_k\,/\,\psi_\theta(s)$。在复数分支明确共轭方向。实参数、复输出时堆叠实/虚部至 $2N_s$；全纯复参数单独验梯度和更新方向，非全纯复参数的 MinSR 沿用原接口的限制。
-2. 保留现有重加权公式 $w_s=|\psi(s)|^{2-r}/\mathrm{mean}(|\psi|^{2-r})$。构造 $\bar O$、$\bar E$ 时先减普通样本均值，再乘 $\sqrt{w_s/N_s}$。报告能量和计算整体尺度步长用各自的加权均值。默认卷积权重及其前向为 `float32`，波函数末端、累积及求解用 `float64` 或对应复数类型。
-3. 用 `torch.linalg.eigh` 复刻 Hermitian 谱求解、小特征值平滑抑制和相关求解器配置。比较 $T$、应用伪逆后的向量及更新残差，以稳定子空间和求解结果验收，特征向量的符号/相位可以不同。核对参数顺序、共轭转置、更新负号、整体尺度步长和有效性检查。本阶段使用 eager 和明确精度设置。
-4. 再实现两遍分块反传。从对称投影后的波函数输出沿网络逆序传递余切向量，用 `torch.func.vjp` 逐块求导。第一遍将 $\bar O_b\bar O_b^\dagger$ 累加到样本空间矩阵，求解后第二遍重算块导数并执行 $\bar O_b^\dagger v$。分别控制参数块、样本批次和前向 `max_parallel`，计算前向分批时计入每个样本的对称构型数。用完整矩阵参考覆盖单块、多块、冻结层、多 ansatz 和复输出，再在单卡记录采样、连接估计、两遍反传、求解的冷启动、稳定期耗时和峰值显存。根据实测选择是否对热点启用编译。
-5. 移植现成的同节点多设备计算。使用固定样本把单卡和两卡的全局均值、重加权、样本空间矩阵及步长对齐。任一按样本分片的实现需覆盖跨设备样本之间的矩阵元素。[原分块实现](../quantax/optimizer/minsr.py) · [中心化/更新方向](../quantax/optimizer/tdvp.py) · [求解器](../quantax/optimizer/solver.py)
-
-### 4.4 补齐复现代码与示例入口
-
-1. 补齐本 checkout 的 `ResProd`、RBM、其他网络和符号先验，通用算符和算符组合，其他晶格和对称性，精确/随机采样器、`TDVP`、`TDVP_exact`、`TimeEvol` 及其求解器。五个教程用缩小的配置逐个检查，比较小系统能量、保真度、扇区和输出文件。
-2. 接通 `examples_torch/` 的三个独立入口和新流水线。短测先检查普通训练的权重可直接用于对称性训练，第二阶段的权重可直接测量。用替身验证默认阶段顺序、跳过首阶段、配置传递、一阶段失败和中断及缺失 checkpoint 时的报告。审查最终 diff，确认现有 `examples/` 原文件全部保留。
-3. 保持现有 `training.log`、`training_symm.log`、`measurement.log`、`measurement.csv`、`summary.json` 和训练 PDF 的字段、口径及生成时机。检查 CSV 行数、累计统计、JSON 权重来源、最终权重以及 PDF 嵌入的 Arial 字体。运行产物存入 `runs/`，按仓库规定管理需要入库的产物。[原流程编排](../examples/run_pipeline.py) · [训练绘图](../quantax/utils/plot.py)
-4. 交付可复核记录，列出环境、对照样本/权重、确定性偏差、各入口短测产物、CUDA 显存和完整流水线命令。对确认过的命令、参数和输出同步更新项目文档。
-
-### 4.5 CPU 对照命令
-
-以下命令从仓库根目录执行。原有 `.venv/` 生成 JAX 参考，独立的 Torch 环境读取同一权重和样本并比较。命令中的参考目录放在已忽略的 `runs/` 中。
+在仓库根目录用 JAX 导出固定权重和构型，再用 Torch 读取同一份输入：
 
 ```bash
 CUDA_VISIBLE_DEVICES="" JAX_PLATFORMS=cpu OMP_NUM_THREADS=1 \
@@ -85,26 +62,25 @@ CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=1 \
   environments/py311-torch/.venv/bin/python -m scripts.check_torch --reference runs/torch-reference
 ```
 
-已通过 4×4 方格的固定输入对照。JAX/Torch 局域能量的最大绝对差为 $2.74\times10^{-7}$，MinSR 更新向量的最大绝对差为 $3.87\times10^{-6}$。Torch 环境未安装 QuSpin，三个独立入口均通过 8 样本、每阶段 2 步的 CPU 短测。另一组 CPU 测试验证了两个进程分片计算与单进程的更新一致。CUDA 普通训练的固定输入检查和 50 步性能对照见[实现改进](implementation-improvements.md#pytorch普通训练的-cuda-性能)。完整流水线的正式数值验收仍未完成。
+4×4 方格的 CPU 对照已通过。一次复查中，逐样本局域能量和 MinSR 更新的最大绝对差分别为 $2.74\times10^{-7}$ 和 $3.88\times10^{-6}$。三个独立入口通过了无 QuSpin 的 CPU 短测；另有 CPU 检查验证两进程分片与单进程的更新一致，不能代替双 GPU 验收。CUDA 数值检查和三阶段各 2 步的流水线短测也已通过。
 
-## 5. 验收与比较方法
+完整验收用下面两组 16 通道的 JAX 归档作为参考。训练统计取各阶段末 200 步的平均总能量和中心方差，每步使用更新前的样本。测量均为 100 轮，固定对应的对称性训练权重；B 采用同一权重的 100 轮重测结果。
 
-| 层级 | 通过条件 |
-| --- | --- |
-| 固定输入 | 邻接、对称置换、采样提议和接受掩码逐项相同。比较原始/投影振幅、局域能量、$\bar O$、$\bar E$、$T$、尺度和参数更新。纯 FP64 小规模算子可从 `rtol=1e-9, atol=1e-11` 起验，含 FP32 卷积的路径从 `rtol=1e-5, atol=1e-7` 起验。对接近波函数零点或谱截断的用例，分别报告分子/分母、保留子空间、残差和更新方向误差，根据固定样本结果在长跑前冻结容差。 |
-| 相同归档权重 | 用 A 的对称权重评估同一批固定构型。独立 MCMC 的 100 轮测量对照 A 的 `measurement.csv`，比较总能量、每格点能量、中心方差和累计曲线。用轮次分块估计均值误差，块长由自相关和稳健性检查确定。训练日志中的 `VarE` 和测量二阶矩按各自定义解释。 |
-| 从初始化到测量 | 使用第 2 节配置。从头完成两段训练并测量 100 轮，两个训练阶段的最后 200 步均值分别比较 A 和 B。阶段间读取的必须是本次运行产生的最终权重。整个流程同时检查能量趋势、方差趋势、日志/产物完整性及是否出现非有限值。 |
+| JAX 归档 | 普通训练：总能量 / 方差 | 对称性训练：总能量 / 方差 | 测量：总能量 / 每格点能量 / 方差 |
+| --- | ---: | ---: | ---: |
+| A，RTX 5060 Ti | −198.08309 / 21.61546 | −198.79243 / 7.52806 | [−198.81543814 / −1.98815438 / 5.23723064](../runs/j1j2_square_10x10_J1-1_J2-0.5/20261119_150209/summary.json) |
+| B，RTX 4070 Ti | −197.61995 / 20.39306 | −198.69231 / 6.21788 | [−198.78751226 / −1.98787512 / 6.20959269](../runs/j1j2_square_10x10_J1-1_J2-0.5/20261120_022539/summary.json) |
 
-**独立运行的首轮拟议容差。** 普通训练末 200 步平均总能量落在 A/B 两个参考值的区间向两侧各扩展 0.5 后的范围；对称性训练按同样方法各扩展 0.2。各阶段平均方差落在同阶段两个参考值区间的 30% 相对扩展范围内。最终测量相对 A 的总能量绝对偏差建议为 0.10 以内，对应每格点 0.001；中心方差绝对偏差建议为 1.5 以内。两份训练归档只用于给出量级，测量阈值和块统计一起复核。上述均是拟议的工程容差，在正式运行前随计划确认。
+归档目录、能量换算和另一次 32 通道的完整结果见[复现记录](reproduction-results.md#已完成的复现)。
 
-## 6. 待用户复核后的完整运行
+验收分两项：先用 A 的对称性权重做 100 轮独立测量，比较总能量、每格点能量和中心方差，用测量轮次分块估计均值误差；再从随机初始化跑完三阶段，核对权重交接、非有限值、产物，以及两段训练末 200 步统计和最终测量。训练日志的 `VarE` 是中心方差，测量 CSV 的原始二阶矩不是方差；`summary.json` 汇报从累计二阶矩减去累计平均能量平方所得的中心方差。
 
-复核后使用独立的 Python 3.11 Torch 环境，从仓库根目录执行以下命令。示例种子用于记录和重跑 Torch 验收，历史训练日志没有记录可复用的种子。
+独立运行的拟议容差：普通训练、对称性训练的平均总能量分别按 A/B 区间向两端扩展 0.5 和 0.2；各阶段平均方差按相应区间相对扩展 30%。最终测量以 A 为主基准，暂用总能量偏差 0.10（每格点 0.001）和中心方差偏差 1.5。这些是待确认的工程容差，不是已验证的结果或误差上界。
 
-```bash
-environments/py311-torch/.venv/bin/python -m examples_torch.run_pipeline \
-  --device cuda --seed 2347 --nsamples 1000 \
-  --steps 2000 --symm-steps 1000 --measure-steps 100
-```
+## 功能边界
 
-复核材料包括阶段配置、主基准和拟议容差，以及固定输入对照结果。正式运行完成后按阶段汇总统计值、基准差异、耗时、峰值显存和产物路径。
+- 主流程不依赖 QuSpin。稠密对称基底、精确对角化、精确采样和 `TDVP_exact` 仍需可选的 QuSpin 接口；需要时在 Torch 环境安装 `--extra ed` 的辅助依赖和兼容的 `cp311` QuSpin wheel。
+- Torch 保留 `Variational` 的批量求值和态组合、算符组合及可替换求解器。原来的 JAX 转换协议以及 NetKet/jVMC 适配留在 JAX 侧。主流程通过短测不代表所有教程、对称扇区或多设备配置均已验收。
+- 历史 Flax ResNet1、未随本仓库发布的入口和数据，以及单步 Lanczos、零方差外推、能隙拟合、结构因子和关联比，不在这次移植的验收范围内。
+
+[原 JAX 流程](../examples/run_pipeline.py) · [项目总览](project-overview.md) · [教程指南](tutorial-guide.md)

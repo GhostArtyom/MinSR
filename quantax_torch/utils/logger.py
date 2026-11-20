@@ -3,7 +3,6 @@
 import logging
 import os
 import platform
-import subprocess
 from datetime import datetime
 from itertools import count
 from pathlib import Path
@@ -65,25 +64,14 @@ def _ram_total():
 
 
 def _gpu_inventory(devices):
-    # Query installed NVIDIA hardware even for CPU runs.
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
-            capture_output=True, text=True, check=True, timeout=2,
-        )
-        gpus = []
-        for line in result.stdout.splitlines():
-            name, sep, memory = line.rpartition(",")
-            if sep and name.strip() and memory.strip():
-                gpus.append(f"{name.strip()} ({memory.strip()} VRAM)")
-        if gpus:
-            return "; ".join(gpus)
-    except (OSError, subprocess.SubprocessError):
-        pass
     import torch
 
-    gpus = [torch.cuda.get_device_name(device) for device in devices if device.type == "cuda"]
-    return "; ".join(gpus) if gpus else "not detected"
+    gpus = []
+    for device in devices:
+        if device.type == "cuda":
+            props = torch.cuda.get_device_properties(device)
+            gpus.append(f"{props.name} ({props.total_memory / 2**30:.2f} GiB VRAM)")
+    return "; ".join(gpus) if gpus else "not used"
 
 
 def log_devices(logger, devices):

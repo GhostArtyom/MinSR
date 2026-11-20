@@ -10,27 +10,35 @@ from .state import State
 from ..nn import Lambda, Sequential, Theta0Layer
 
 
-def _evaluate(net, inputs, params=None):
+def _evaluate(net, inputs, params=None, inference_fn=None):
     shape = inputs.shape[:-1]
     spins = inputs.reshape(-1, inputs.shape[-1])
 
     def forward(x):
-        return net(x) if params is None else functional_call(net, params, (x,))
+        if params is not None:
+            return functional_call(net, params, (x,))
+        return net(x) if inference_fn is None else inference_fn(net, x)
 
     values = forward(spins) if isinstance(net, Sequential) else vmap(forward)(spins)
     return values.reshape(shape)
 
 
 class Variational(State):
+    """A variational state with an optional inference-only ``(net, inputs)`` callable."""
+
     def __init__(self, ansatz, param_file=None, symm=None, max_parallel=None,
-                 input_fn=None, output_fn=None, *, device=None):
+                 input_fn=None, output_fn=None, *, device=None, inference_batch=None, inference_fn=None):
         super().__init__(symm)
         self.ansatz = (ansatz,) if isinstance(ansatz, nn.Module) else tuple(ansatz)
         if not self.ansatz or (len(self.ansatz) > 1 and (input_fn is None or output_fn is None)):
             raise ValueError("Multiple networks require an input function and an output function.")
         if max_parallel is not None and max_parallel < self.nsymm:
             raise ValueError("max_parallel must fit at least one symmetry orbit.")
+        if inference_batch is not None and inference_batch < self.nsymm:
+            raise ValueError("inference_batch must fit at least one symmetry orbit.")
         self.max_parallel = max_parallel
+        self.inference_batch = inference_batch
+        self.inference_fn = inference_fn
         self._default_input = input_fn is None
         self._default_output = output_fn is None
         self.input_fn = (lambda s: (self.symm.get_symm_spins(s),)) if input_fn is None else input_fn
@@ -81,8 +89,22 @@ class Variational(State):
             return self.output_fn(values)
         return vmap(self.output_fn)(values)
 
+    def _evaluate_spins(self, spins, inference_fn=None):
+        values = tuple(_evaluate(net, x, inference_fn=inference_fn)
+                       for net, x in zip(self.ansatz, self._inputs(spins), strict=True))
+        return self._output(values)
+
     def _raw(self, spins):
-        return self._output(tuple(_evaluate(net, x) for net, x in zip(self.ansatz, self._inputs(spins), strict=True)))
+        return self._evaluate_spins(spins)
+
+    def _inference(self, spins):
+        # Derivatives use _raw and the original modules, not this backend.
+        return self._evaluate_spins(spins, self.inference_fn)
+
+    @property
+    def forward_batch(self):
+        """Raw network inputs per inference batch, counting symmetry members."""
+        return min((cap for cap in (self.max_parallel, self.inference_batch) if cap is not None), default=None)
 
     @torch.no_grad()
     def __call__(self, spins, ref_states=None):
@@ -91,11 +113,16 @@ class Variational(State):
         spins = spins.reshape(-1, self.nsites)
         if not len(spins):
             return torch.empty(shape, dtype=self.dtype, device=self.device)
-        batch = len(spins) if self.max_parallel is None else self.max_parallel // self.nsymm
-        psi = torch.cat([self._raw(s) for s in spins.split(batch)]).reshape(shape)
+        cap = self.forward_batch
+        batch = len(spins) if cap is None else cap // self.nsymm
+        evaluate = self._raw if self.inference_fn is None else self._inference
+        psi = torch.cat([evaluate(s) for s in spins.split(batch)]).reshape(shape)
+        self._record_maximum(psi)
+        return psi
+
+    def _record_maximum(self, psi):
         maximum = psi.abs().amax().to(self._maximum.dtype)
         self._maximum.copy_(torch.where(maximum.isfinite(), torch.maximum(maximum, self._maximum), self._maximum))
-        return psi
 
     @torch.no_grad()
     def jacobian(self, spins, *, chunk_size=16, logarithmic=True):
