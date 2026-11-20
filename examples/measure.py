@@ -61,7 +61,7 @@ def _measure(
             raise FileNotFoundError(f"Measurement weights do not exist: {param_file}")
         log_devices(logger, jax.devices())
         qtx.sites.Square(L)
-        H = qtx.operator.Heisenberg(J=[J1, J2], n_neighbor=[1, 2], msr=True)
+        H = qtx.operator.Heisenberg(J=[J1, J2], n_neighbor=[1, 2], msr=True, device_local=True)
         net = qtx.nn.ResSum(DEPTH, CHANNELS, KERNEL_SIZE, use_sinh=USE_SINH)
         state = qtx.state.Variational(
             net, param_file=param_file, symm=TotalSz() + SpinInverse() + C4v(), max_parallel=MAX_PARALLEL,

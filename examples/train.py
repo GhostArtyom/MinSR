@@ -41,7 +41,7 @@ def _train(
         setup_plot_font()
 
         lattice = qtx.sites.Square(L)
-        H = qtx.operator.Heisenberg(J=[J1, J2], n_neighbor=[1, 2], msr=True)
+        H = qtx.operator.Heisenberg(J=[J1, J2], n_neighbor=[1, 2], msr=True, device_local=True)
         net = qtx.nn.ResSum(DEPTH, CHANNELS, KERNEL_SIZE, use_sinh=USE_SINH)
         state = qtx.state.Variational(net, symm=TotalSz(), max_parallel=MAX_PARALLEL)
 

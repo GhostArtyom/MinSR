@@ -136,6 +136,8 @@ JAX 负责自动微分、编译和设备计算，Equinox 负责网络模块和�
 
 两个训练脚本每 10 步刷新能量和方差的全程图和滚动图（`_rolling.pdf`），每 100 步保存权重；最后一步也保存曲线和权重。
 
+三个阶段都为 Heisenberg 算符启用 `device_local=True`。在单设备上，局域能量所需的自旋交换、波函数求值和求和都在同一设备完成，按 `MAX_PARALLEL` 限制前向批量。通用 QuSpin 路径仍可用，未启用该选项或不满足单设备等条件时沿用原路径。数据流和对照测试见[实现改进记录](implementation-improvements.md)。
+
 [measure.py](../examples/measure.py) 反复采样测量能量，不更新参数。单独运行时用 `--network-idx` 选择下表中的网络，默认选 1。测量自定义网络时用 `--param-file` 指定权重，并用 `--depth`、`--channels` 指定与权重匹配的结构，不同时传 `--network-idx`：
 
 | `network_idx` | 网络配置 | 参数文件 |

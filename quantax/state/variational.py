@@ -174,8 +174,8 @@ class Variational(State):
             return outputs
 
         self.forward_fn = eqx.filter_jit(forward_fn)
-        forward_vmap = eqx.filter_jit(jax.vmap(forward_fn, in_axes=(None, 0)))
-        self.forward_vmap = lambda spins: forward_vmap(self.ansatz, spins)
+        self._forward_batch = eqx.filter_jit(jax.vmap(forward_fn, in_axes=(None, 0)))
+        self.forward_vmap = lambda spins: self._forward_batch(self.ansatz, spins)
 
     def _init_backward(self) -> None:
         """
@@ -282,10 +282,14 @@ class Variational(State):
 
         if not is_input_sharded:
             psi = filter_replicate(psi[:nsamples])
-            maximum = jnp.max(jnp.abs(psi))
-            if self._maximum is None or maximum > self._maximum:
-                self._maximum = maximum
+            self._record_maximum(jnp.max(jnp.abs(psi)))
         return psi
+
+    def _record_maximum(self, maximum: jax.Array) -> None:
+        if self._maximum is None:
+            self._maximum = maximum
+        else:
+            self._maximum = jnp.where(maximum > self._maximum, maximum, self._maximum)
 
     def partition(
         self, ansatz: Optional[eqx.Module] = None

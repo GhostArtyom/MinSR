@@ -46,7 +46,7 @@ def minsr_updates():
     print(f"QuSpin {quspin.__version__}", flush=True)
     qtx.set_random_seed(42)
     qtx.sites.Square(4)
-    hamiltonian = qtx.operator.Heisenberg(J=[1, 0.5], n_neighbor=[1, 2], msr=True)
+    hamiltonian = qtx.operator.Heisenberg(J=[1, 0.5], n_neighbor=[1, 2], msr=True, device_local=True)
     net = qtx.nn.ResSum(2, 2, 3, use_sinh=True)
     state = qtx.state.Variational(net, symm=qtx.symmetry.TotalSz(), max_parallel=32)
     sampler = qtx.sampler.NeighborExchange(
@@ -59,6 +59,27 @@ def minsr_updates():
         assert bool(jnp.all(jnp.isfinite(step))), "Non-finite MinSR update"
         state.update(step * 1e-3)
         print(f"MinSR step {i + 1}: energy={float(optimizer.energy):.8f}", flush=True)
+
+
+def heisenberg_local_energy():
+    import quantax as qtx
+
+    qtx.set_random_seed(42)
+    net = qtx.nn.ResSum(2, 2, 3, use_sinh=True)
+    symm = qtx.symmetry.TotalSz() + qtx.symmetry.SpinInverse() + qtx.symmetry.C4v()
+    state = qtx.state.Variational(net, symm=symm, max_parallel=8 * symm.nsymm)
+    spins = qtx.utils.rand_spins(4, state.total_sz)
+    samples = qtx.sampler.Samples(spins, state(spins), reweight=1.0)
+    for msr in (False, True):
+        options = dict(J=[1, 0.5], n_neighbor=[1, 2], msr=msr)
+        reference = qtx.operator.Heisenberg(**options)
+        device = qtx.operator.Heisenberg(**options, device_local=True)
+        np.testing.assert_allclose(device.Oloc(state, samples), reference.Oloc(state, samples),
+                                   rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(device.expectation(state, samples, return_var=True),
+                                   reference.expectation(state, samples, return_var=True), rtol=1e-6)
+    polarized = jnp.ones((1, state.nsites), dtype=jnp.int8)
+    np.testing.assert_allclose(device.Oloc(state, polarized), [48.0], rtol=1e-6)
 
 
 def main():
@@ -82,15 +103,17 @@ def main():
             results[name] = str(error)
             print(name, "FAIL:", type(error).__name__, str(error), flush=True)
     if not args.jax_only:
-        if all(value == "PASS" for value in results.values()):
-            try:
-                minsr_updates()
-                results["minsr_updates"] = "PASS"
-            except Exception as error:
-                results["minsr_updates"] = str(error)
-                print("minsr_updates FAIL:", type(error).__name__, str(error), flush=True)
-        else:
-            results["minsr_updates"] = "SKIPPED: JAX checks failed"
+        for name, check in [("minsr_updates", minsr_updates), ("heisenberg_local_energy", heisenberg_local_energy)]:
+            if all(value == "PASS" for value in results.values()):
+                try:
+                    check()
+                    results[name] = "PASS"
+                    print(name, "PASS", flush=True)
+                except Exception as error:
+                    results[name] = str(error)
+                    print(name, "FAIL:", type(error).__name__, str(error), flush=True)
+            else:
+                results[name] = "SKIPPED: prerequisite check failed"
     print("RESULTS", json.dumps(results), flush=True)
     return 0 if all(value == "PASS" for value in results.values()) else 1
 
