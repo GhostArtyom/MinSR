@@ -1,7 +1,7 @@
 import argparse
 from pathlib import Path
 
-from .config import Config, add_common_options, add_sampling_options
+from .run_pipeline import Config, add_common_options, add_sampling_options
 
 
 def main(param_file, config=None, *, steps=1000, thermal_steps=None, sweep_steps=None):

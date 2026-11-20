@@ -39,8 +39,8 @@
 
 - **包与环境。** `quantax_torch/` 对应当前 `quantax/`。Torch 实现、示例和验收统一使用 Python 3.11，PyTorch 2.10.0/CUDA 12.8 锁定在 `environments/py311-torch/`。运行 `uv sync --project environments/py311-torch --locked` 建立该目录下的 `.venv/`。现有两套 JAX 环境用于对照。原包中的 JAX 转换协议以及 NetKet/jVMC 适配留在 JAX 侧。
 - **物理数据和设备。** 晶格坐标、邻接键、对称置换和字符由 NumPy 准备，批量波函数求值、采样和局域能量都在 Torch 张量上执行。三个示例入口可在无 QuSpin 环境中运行。稠密对称基底、精确对角化、精确采样和 `TDVP_exact` 仍通过可选的 QuSpin 接口执行。需要这些功能时，可在 Torch 环境安装 `--extra ed` 的辅助依赖及兼容目标机器的 `cp311` QuSpin wheel。现阶段使用已有 JAX 环境做对应的小系统对照。
-- **Torch 示例。** 根目录新增 `examples_torch/`，包含 `train.py`、`train_symm.py`、`measure.py` 和 `run_pipeline.py`，直接导入 `quantax_torch`。三阶段共享解析好的体系/网络配置和样本数，分别设置训练步数、续训步数、测量轮数和采样配置。续训接受 `--param-file`，测量提供对应的网络预设和显式 checkpoint 路径。日志记录实际配置、后端/设备、种子以及 checkpoint 来源。
-- **流水线。** 通过 `python -m examples_torch.run_pipeline` 进入 Torch 流程。使用独立子进程启动各阶段，由阶段返回实际产物路径，下一阶段直接消费该路径。保留 `--from-checkpoint` 及出错后停止后续阶段的语义。使用新运行目录区分 Torch 产物与历史结果。只在最终测量完成后生成最终汇总，保留中断前已刷新的 CSV。
+- **Torch 示例。** 根目录新增 `examples_torch/`，包含 `train.py`、`train_symm.py`、`measure.py` 和 `run_pipeline.py`，直接导入 `quantax_torch`。三阶段共享体系和网络配置，默认使用相同的样本数，分别设置训练步数、续训步数、测量轮数和采样配置。续训接受 `--param-file`，测量提供对应的网络预设和显式 checkpoint 路径。日志记录实际配置、后端/设备、种子以及 checkpoint 来源。
+- **流水线。** 在 `examples_torch/run_pipeline.py` 开头编辑 `Config` 的公共默认值、`STAGES` 的阶段配置及 `FROM_CHECKPOINT`，然后运行 `python -m examples_torch.run_pipeline`。在 `STAGES` 中可为某一阶段覆盖 `nsamples`、`max_parallel`、`thermal_steps` 和 `sweep_steps`；保持晶格和网络配置一致。也可用命令行设置公共参数、覆盖各阶段的 `steps` 或指定 `--from-checkpoint`。流水线用独立子进程启动各阶段，将实际产物路径交给下一阶段，遇到错误立即停止。输出目录与 JAX 归档分开，只在最终测量完成后生成 `summary.json`，保留中断前已刷新的 CSV。
 - **权重格式。** 对本 checkout 的 `ResSum`，Torch 入口可直接读取 Equinox `.eqx` 的 NumPy 数组流，按对应模型的参数和 buffer 顺序导入，包括 `theta0`，同时核验叶子的形状、dtype 和文件结束位置。阶段间使用带元数据和版本号的 Torch `state_dict`，例如 `params_2000.pt` 和 `params_symm_1000.pt`，跨阶段重新热化。
 - **可扩展接口。** 沿用 `Variational` 的批量求值、`input_fn`/`output_fn` 和态组合；算符提供连接构型及矩阵元、$H\psi$、局域估计量和期望值接口；采样结果保留构型、振幅、重加权因子；优化器接受求解器回调和可遍历的导数块。后续 Lanczos 可组合 $\psi$ 和 $H\psi$，外推可消费能量/方差输出，自旋与二聚体观测量可复用通用算符。先用已存在的功能验证这些接口。
 

@@ -2,33 +2,131 @@
 
 import argparse
 import importlib
+import math
 import multiprocessing
+from dataclasses import dataclass, replace
 from pathlib import Path
 
-from .config import Config, add_common_options
+# Edit these settings, then run: python -m examples_torch.run_pipeline
+ROOT = Path(__file__).resolve().parents[1]
+FROM_CHECKPOINT = None  # Set to a training checkpoint to skip the first stage.
+# Keep lattice and network settings shared. A stage can override nsamples or
+# max_parallel, or set thermal_steps and sweep_steps instead of the defaults.
+STAGES = {
+    "train": {"steps": 2000},
+    "train_symm": {"steps": 1000},
+    "measure": {"steps": 100},
+}
 
 
-def _worker(stage, connection, config, checkpoint, steps):
+@dataclass(frozen=True)
+class Config:
+    # Common settings for all three stages.
+    L: int = 10
+    J1: float = 1.0
+    J2: float = 0.5
+    depth: int = 16
+    channels: int = 16
+    kernel_size: int = 3
+    use_sinh: bool = True
+    nsamples: int = 1000
+    step_size: float = 1e-3
+    max_parallel: int = 32768
+    jacobian_batch: int = 8
+    seed: int = 2347
+    device: str = "cuda"
+    output_dir: Path = ROOT / "runs" / "torch"
+
+    def __post_init__(self):
+        if self.L < 2 or self.L % 2:
+            raise ValueError("This square-lattice example needs an even L with L >= 2.")
+        if self.depth < 2 or self.depth % 2:
+            raise ValueError("depth must be positive and even.")
+        if min(self.channels, self.kernel_size, self.nsamples, self.max_parallel, self.jacobian_batch) < 1:
+            raise ValueError("Network and batch sizes must be positive.")
+        if not all(math.isfinite(x) for x in (self.J1, self.J2, self.step_size)) or self.step_size <= 0:
+            raise ValueError("The couplings must be finite and step_size must be finite and positive.")
+
+    @property
+    def system(self):
+        return f"j1j2_square_{self.L}x{self.L}_J1-{self.J1:g}_J2-{self.J2:g}"
+
+    @property
+    def network(self):
+        return {key: getattr(self, key) for key in ("depth", "channels", "kernel_size", "use_sinh")}
+
+    def sampling(self, thermal_steps, sweep_steps, *, measurement=False):
+        thermal_default = 100 if measurement else 20
+        sweep_default = 10 if measurement else 2
+        thermal_steps = thermal_default * self.L**2 if thermal_steps is None else thermal_steps
+        sweep_steps = sweep_default * self.L**2 if sweep_steps is None else sweep_steps
+        if min(thermal_steps, sweep_steps) < 0:
+            raise ValueError("Thermalization and sweep steps must be nonnegative.")
+        return thermal_steps, sweep_steps
+
+    def network_for_preset(self, index):
+        depth, channels, filename = PRESETS[index]
+        return replace(self, depth=depth, channels=channels), ROOT / "params" / filename
+
+
+PRESETS = {
+    1: (16, 16, "square10x10_1616.eqx"),
+    2: (16, 32, "square10x10_1632.eqx"),
+    3: (30, 64, "square10x10_3064.eqx"),
+}
+
+
+def add_common_options(parser):
+    defaults = Config()
+    for name in ("L", "J1", "J2", "depth", "channels", "kernel_size", "nsamples",
+                 "step_size", "max_parallel", "jacobian_batch", "seed", "device", "output_dir"):
+        value = getattr(defaults, name)
+        kind = Path if isinstance(value, Path) else type(value)
+        flag = name.lower().replace("_", "-")
+        parser.add_argument(f"--{flag}", dest=name, type=kind, default=value)
+    parser.add_argument("--use-sinh", action=argparse.BooleanOptionalAction, default=defaults.use_sinh)
+
+
+def add_sampling_options(parser):
+    parser.add_argument("--thermal-steps", type=int)
+    parser.add_argument("--sweep-steps", type=int)
+
+
+def _stage_options(stage, config, steps):
+    overrides = STAGES[stage].copy()
+    length = overrides.pop("steps")
+    steps = length if steps is None else steps
+    if steps < 1:
+        raise ValueError(f"{stage}: steps must be positive.")
+    thermal = overrides.pop("thermal_steps", None)
+    sweep = overrides.pop("sweep_steps", None)
+    config = replace(config, **overrides) if overrides else config
+    thermal, sweep = config.sampling(thermal, sweep, measurement=stage == "measure")
+    return config, {"steps": steps, "thermal_steps": thermal, "sweep_steps": sweep}
+
+
+def _worker(stage, connection, checkpoint, config, options):
     module = importlib.import_module(f"examples_torch.{stage}")
+    steps = options["steps"]
     with connection:
         if stage == "train":
-            run = module.main(config=config, steps=steps)
+            run = module.main(config=config, **options)
             result = run / f"params_{steps}.pt"
         elif stage == "train_symm":
-            run = module.main(checkpoint, config=config, steps=steps)
+            run = module.main(checkpoint, config=config, **options)
             result = run / f"params_symm_{steps}.pt"
         else:
-            run = module.main(checkpoint, config=config, steps=steps)
+            run = module.main(checkpoint, config=config, **options)
             result = run / "summary.json"
         if not result.is_file():
             raise RuntimeError(f"{stage} did not produce {result}.")
         connection.send(result)
 
 
-def _run_stage(stage, config, checkpoint, steps):
+def _run_stage(stage, checkpoint, config, options):
     context = multiprocessing.get_context("spawn")
     receiver, sender = context.Pipe(duplex=False)
-    process = context.Process(target=_worker, args=(stage, sender, config, checkpoint, steps))
+    process = context.Process(target=_worker, args=(stage, sender, checkpoint, config, options))
     with receiver, sender:
         print(f"Starting {stage}...", flush=True)
         process.start()
@@ -49,20 +147,22 @@ def _run_stage(stage, config, checkpoint, steps):
             process.close()
 
 
-def main(config=None, *, steps=2000, symm_steps=1000, measure_steps=100, from_checkpoint=None):
+def main(config=None, *, steps=None, symm_steps=None, measure_steps=None, from_checkpoint=FROM_CHECKPOINT):
     config = Config() if config is None else config
-    if min(steps, symm_steps, measure_steps) < 1:
-        raise ValueError("All stage lengths must be positive.")
+    stages = {
+        stage: _stage_options(stage, config, length)
+        for stage, length in (("train", steps), ("train_symm", symm_steps), ("measure", measure_steps))
+    }
     if from_checkpoint is None:
-        checkpoint = _run_stage("train", config, None, steps)
+        checkpoint = _run_stage("train", None, *stages["train"])
         print(f"Training checkpoint: {checkpoint}", flush=True)
     else:
         checkpoint = Path(from_checkpoint).expanduser().resolve()
         if not checkpoint.is_file():
             raise FileNotFoundError(f"Training weights do not exist: {checkpoint}")
-    checkpoint = _run_stage("train_symm", config, checkpoint, symm_steps)
+    checkpoint = _run_stage("train_symm", checkpoint, *stages["train_symm"])
     print(f"Symmetry checkpoint: {checkpoint}", flush=True)
-    summary = _run_stage("measure", config, checkpoint, measure_steps)
+    summary = _run_stage("measure", checkpoint, *stages["measure"])
     print(f"Measurement summary: {summary}", flush=True)
     return summary.parent
 
@@ -70,10 +170,10 @@ def main(config=None, *, steps=2000, symm_steps=1000, measure_steps=100, from_ch
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     add_common_options(parser)
-    parser.add_argument("--steps", type=int, default=2000)
-    parser.add_argument("--symm-steps", type=int, default=1000)
-    parser.add_argument("--measure-steps", type=int, default=100)
-    parser.add_argument("--from-checkpoint", type=Path)
+    parser.add_argument("--steps", type=int)
+    parser.add_argument("--symm-steps", type=int)
+    parser.add_argument("--measure-steps", type=int)
+    parser.add_argument("--from-checkpoint", type=Path, default=FROM_CHECKPOINT)
     args = vars(parser.parse_args())
     controls = {key: args.pop(key) for key in ("steps", "symm_steps", "measure_steps", "from_checkpoint")}
     main(Config(**args), **controls)

@@ -1,6 +1,6 @@
 import argparse
 
-from .config import Config, add_common_options, add_sampling_options
+from .run_pipeline import Config, add_common_options, add_sampling_options
 
 
 def main(config=None, *, steps=2000, thermal_steps=None, sweep_steps=None):
