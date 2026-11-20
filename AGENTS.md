@@ -34,4 +34,6 @@ Paper materials are in [`docs/Chen-2024-MinSR/`](docs/Chen-2024-MinSR/). Use the
 - [Searchable full text (Markdown)](docs/Chen-2024-MinSR/paper.md)
 - [Chinese paper analysis](docs/Chen-2024-MinSR/analysis.md)
 
+When citing a paper figure in repository documentation, use the existing assets in [`docs/Chen-2024-MinSR/images/`](docs/Chen-2024-MinSR/images/) when available. Embed or link the relevant image with a relative path and identify the original figure or panel in the caption.
+
 The [README](README.md) also links to the publisher's version.

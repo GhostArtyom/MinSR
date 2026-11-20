@@ -109,7 +109,7 @@ Ising 模型含单自旋翻转项，教程使用 `LocalFlip`。Heisenberg 类模
 | [quantax/optimizer/](../quantax/optimizer/) | TDVP、精确更新、MinSR、实时间演化和线性求解器 |
 | [quantax/utils/](../quantax/utils/) | 自旋编码、数组分片、参数树操作和 `DataTracer` |
 | [tutorials/](../tutorials/) | 5 个讲解模型和接口的 Notebook |
-| [examples/](../examples/) | 较大系统的训练、对称化续训和权重测量脚本 |
+| [examples/](../examples/) | 较大系统的普通训练、对称性训练和测量脚本 |
 | [params/](../params/) | 10×10 方格、$J_2/J_1=0.5$ 的 3 组已训练权重 |
 | [data/](../data/) | `Fig2a.csv`、`Fig2b.csv`、`Fig2c.csv`、`Fig3.csv` 图表数据 |
 | [images/](../images/) | 论文相关示意图和结果图 |
@@ -118,13 +118,13 @@ JAX 负责自动微分、编译和设备计算，Equinox 负责网络模块和�
 
 ## 从教程到论文规模示例
 
-只需修改 [run_pipeline.py](../examples/run_pipeline.py) 开头的配置区：`COMMON` 设置共用的晶格、网络、样本数等参数，其中 `STEP_SIZE` 只用于普通训练和对称续训；`STAGES` 设置各阶段的 `STEPS` 等参数，也可在某个阶段单独覆盖 `NSAMPLES`。从仓库根目录直接运行，不用传参：
+只需修改 [run_pipeline.py](../examples/run_pipeline.py) 开头的配置区：`COMMON` 设置共用的晶格、网络、`NSAMPLES` 等参数，其中 `STEP_SIZE` 只用于两个训练阶段；`STAGES` 设置各阶段的 `STEPS` 等参数，也可在某个阶段单独覆盖 `NSAMPLES`。从仓库根目录直接运行，不用传参：
 
 ```bash
 .venv/bin/python -m examples.run_pipeline
 ```
 
-流水线依次执行普通训练、对称续训和测量，并自动传递各阶段的最终权重。已有第一阶段权重时，可设置配置区的 `FROM_CHECKPOINT` 跳过普通训练；网络设置必须与权重匹配。
+流水线依次执行普通训练、对称性训练和测量，并自动传递各阶段的最终权重。已有第一阶段权重时，可设置配置区的 `FROM_CHECKPOINT` 跳过普通训练；网络设置必须与权重匹配。
 
 三个阶段脚本单独运行时，都可用命令行临时覆盖各自的配置参数，未指定的参数沿用 `run_pipeline.py` 中的默认值。例如 `.venv/bin/python -m examples.train --STEPS 1000 --NSAMPLES 2000 --step-size 0.001`。参数名支持大写下划线或小写连字符两种写法，如 `--MAX_PARALLEL` 和 `--max-parallel`；`--use-sinh` 接受 `true` 或 `false`。各脚本的参数列表见 `--help`。
 
@@ -132,7 +132,7 @@ JAX 负责自动微分、编译和设备计算，Equinox 负责网络模块和�
 
 [train_symm.py](../examples/train_symm.py) 加入 `TotalSz() + SpinInverse() + C4v()` 约束后继续训练。脚本在独立的 `runs/<体系和格点名>/<运行时间>/` 中保存 `training_symm.log`、`energy_symm.pdf`、`VarE_symm.pdf` 和 `params_symm_<步数>.eqx` 等文件。日志开头记录运行配置和权重来源，随后以与 `train.py` 相同的格式记录能量、方差、完成步数及耗时，异常时记录堆栈。
 
-单独续训时用 `.venv/bin/python examples/train_symm.py --param-file <权重文件>` 指定第一阶段的 `.eqx` 文件，并确保网络设置与权重匹配。相对路径从当前工作目录解析。
+单独运行对称性训练时，用 `.venv/bin/python examples/train_symm.py --param-file <权重文件>` 指定第一阶段的 `.eqx` 文件，并确保网络设置与权重匹配。相对路径从当前工作目录解析。
 
 两个训练脚本每 10 步刷新能量和方差的全程图和滚动图（`_rolling.pdf`），每 100 步保存权重；最后一步也保存曲线和权重。
 
@@ -149,6 +149,8 @@ JAX 负责自动微分、编译和设备计算，Equinox 负责网络模块和�
 测量脚本的注释将这些网络对应到论文图 2b 中的 ResNet2（MinSR）结果。`.eqx` 文件保存网络权重，加载时仍须创建匹配的网络结构。单独运行时若未传 `--param-file`，则读取表中自带权重；若已修改共用的晶格尺寸、卷积核或输出层设置，使用自带权重前要恢复与预设匹配的设置。`THERMAL_STEPS` 和 `SWEEP_STEPS` 分别控制初始化热化和每轮采样的更新次数，默认按实际使用的晶格尺寸取 $100L^2$ 和 $10L^2$，也可分别覆盖。每次运行创建独立的 `runs/<体系和格点名>/<运行时间>/`，`measurement.log` 开头记录运行配置和权重来源，随后记录累计平均能量、累计方差、完成步数与耗时；`measurement.csv` 逐轮保存能量、局域能量二阶矩、累计平均能量和累计方差，并立即刷新；`summary.json` 保存最终测量结果和权重来源。中断时保留已写入的 CSV，不生成最终汇总。
 
 ## 读数和运行时需要核对的约定
+
+论文图 2b 与复现结果的对比见[复现记录](reproduction-results.md)，其中汇总了两个训练阶段和测量结果，并列给出每格点能量 $E_{\mathrm{spin}}/N$ 和总能量 $E_{\mathrm{Pauli}}$。
 
 `Heisenberg` 使用 Pauli 矩阵归一化，未启用 `msr` 时每条键对应 $J_{ij}\boldsymbol{\sigma}_i\cdot\boldsymbol{\sigma}_j$。对于通常的自旋算符 $\boldsymbol S=\boldsymbol\sigma/2$，相同耦合常数下能量相差 4 倍。`msr=True` 在第一近邻键上改变横向交换项的符号，纵向项和第二近邻项保持原样。比较教程、脚本与论文表格时，需要核对这一基底约定、能量尺度以及总能量和每格点能量的区别。源码见 [common_operators.py](../quantax/operator/common_operators.py)。
 
