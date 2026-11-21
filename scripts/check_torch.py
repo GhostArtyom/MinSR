@@ -126,7 +126,7 @@ def check_cuda_fast_paths():
     import quantax_torch as qtx
     from examples_torch.run_pipeline import Config
     from examples_torch.workflows import _system
-    from quantax_torch.nn._cuda_support import supports_tuned_kernels
+    from quantax_torch.nn._cuda_support import cuda_capability, supports_tuned_kernels
 
     device = torch.device("cuda")
     tuned = supports_tuned_kernels(device)
@@ -158,12 +158,77 @@ def check_cuda_fast_paths():
     check_derivative_cache()
     check_cuda_gram_syrk()
     if not tuned:
+        if cuda_capability(device) == (8, 9):
+            check_ada_fast_paths()
+            return
         print("Tuned periodic kernels skipped: require CUDA sm_120, Triton and a C compiler.")
         return
     check_periodic_forward()
     check_projected_local_energy_replay()
     check_projected_exchange_replay()
     check_projected_vjp()
+
+
+def check_ada_fast_paths():
+    import torch
+    import quantax_torch as qtx
+    from examples_torch.run_pipeline import Config
+    from examples_torch.workflows import _cuda_inference, _system
+    from quantax_torch.nn import _periodic_cuda
+    from quantax_torch.operator import common_operators
+    from quantax_torch.optimizer import minsr
+
+    config = Config()
+    device = torch.device("cuda")
+    assert torch.cuda.get_device_capability(device) == (8, 9)
+    assert _cuda_inference(replace(config, channels=19), device, False) is None
+    assert _cuda_inference(replace(config, nsamples=32), device, False) is None
+    hamiltonian, state = _system(config, False)
+    assert state.inference_fn is _periodic_cuda.res_sum_forward
+    _, ref = _system(replace(config, ordinary_periodic_conv=False), False)
+    spins = qtx.utils.rand_spins(8, 0, device=device)
+    with patch.object(_periodic_cuda, "_run_blocks", wraps=_periodic_cuda._run_blocks) as forward:
+        torch.testing.assert_close(state(spins), ref(spins), rtol=2e-5, atol=1e-7)
+        torch.testing.assert_close(hamiltonian.Oloc(state, spins), hamiltonian.Oloc(ref, spins),
+                                   rtol=3e-5, atol=2e-5)
+        assert forward.called
+    print("sm_89 ordinary periodic forward ran and agrees with cuDNN.")
+    gram_spins = qtx.utils.rand_spins(config.nsamples, 0, device=device)
+    samples = qtx.sampler.Samples(gram_spins, state(gram_spins), reweight=1.0)
+    opt = minsr.MinSR(state, hamiltonian, jacobian_batch=config.jacobian_batch)
+    gram = opt.get_Tmat(samples)
+    assert "cuBLAS SYRK" in opt._gram_backends
+    with patch.object(minsr, "_ada_gram_syrk", return_value=False):
+        torch.testing.assert_close(gram, opt.get_Tmat(samples), rtol=1e-12, atol=1e-14)
+    print("sm_89 ordinary FP64 triangular Gram ran and agrees with full GEMM.")
+
+    assert _cuda_inference(replace(config, projected_forward_batch=2048), device, True) is None
+    assert _cuda_inference(config, device, True) is _periodic_cuda.res_sum_forward
+    hamiltonian, state = _system(config, True)
+    assert state.inference_fn is _periodic_cuda.res_sum_forward
+    _, ref = _system(replace(config, projected_periodic_conv=False), True)
+    spins = qtx.utils.rand_spins(16, 0, device=device)
+    with patch.object(_periodic_cuda, "_run_blocks", wraps=_periodic_cuda._run_blocks) as forward:
+        torch.testing.assert_close(state(spins), ref(spins), rtol=2e-5, atol=1e-7)
+        torch.testing.assert_close(hamiltonian.Oloc(state, spins), hamiltonian.Oloc(ref, spins),
+                                   rtol=2e-4, atol=5e-5)
+        assert forward.called
+    print("sm_89 projected forward ran and agrees with cuDNN.")
+    assert hamiltonian._local_energy_workspaces
+    samples = qtx.sampler.Samples(spins, state(spins), reweight=1.0)
+    eager_operator, _ = _system(replace(config, projected_local_energy_graph=False), True)
+    with patch.object(common_operators, "_replay_exchange", wraps=common_operators._replay_exchange) as replay:
+        torch.testing.assert_close(hamiltonian.Oloc(state, samples), eager_operator.Oloc(state, samples),
+                                   rtol=1e-12, atol=1e-11)
+        assert replay.called and hamiltonian._local_energy_graph_used
+    assert len(hamiltonian._local_energy_workspaces) == 1
+    print("sm_89 local energy ran with a reused CUDA Graph pool and agrees with eager inference.")
+    exchange_spins = qtx.utils.rand_spins(config.nsamples, 0, device=device)
+    for reweight in (1.0, 2.0):
+        eager, captured = _exchange_pair(state, exchange_spins, compact=True, reweight=reweight)
+        assert captured._compact_key is not None
+        _check_exchange_sweep(eager, captured)
+    print("sm_89 compacted exchange replay preserves the chain and RNG for both projection stages.")
 
 
 def check_periodic_forward():
@@ -298,8 +363,8 @@ def check_projected_vjp():
 
     batched = minsr.batched_res_sum_vjp
 
-    def require_batched(*args):
-        result = batched(*args)
+    def require_batched(*args, **kwargs):
+        result = batched(*args, **kwargs)
         assert result is not None
         return result
 

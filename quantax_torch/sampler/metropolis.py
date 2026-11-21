@@ -151,13 +151,24 @@ class NeighborExchange(Metropolis):
                 or getattr(state, "inference_fn", None) is None or torch.are_deterministic_algorithms_enabled()
                 or torch.is_autocast_enabled("cuda")):
             return None
-        from ..nn._cuda_support import supports_tuned_kernels
+        from ..nn._cuda_support import cuda_capability, triton_runtime_issue, validated_ada_res_sum
         from ..state import Variational
         from ..symmetry import Symmetry
 
         if (type(state) is not Variational or type(state.symm) is not Symmetry
-                or not (state._default_input and state._default_output)
-                or not supports_tuned_kernels(state.device)):
+                or not (state._default_input and state._default_output)):
+            return None
+        capability = cuda_capability(state.device)
+        if capability == (8, 9):
+            if (self.reweight not in (1.0, 2.0) or state.nsymm != 16
+                    or state.forward_batch != 1024 or state.dtype != torch.float64
+                    or not validated_ada_res_sum(getattr(state.ansatz[0], "config", None),
+                                                 getattr(state.symm.sites, "shape", ()),
+                                                 self.nsamples, state.max_parallel)):
+                return None
+        elif capability != (12, 0):
+            return None
+        if triton_runtime_issue() is not None:
             return None
         from ..nn._periodic_cuda import counted_res_sum_forward, res_sum_forward, supports_counted_res_sum
 

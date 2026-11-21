@@ -10,6 +10,7 @@ from ._res_sum import batched_res_sum_vjp
 from .solver import minsr_pinv_eig
 from .tdvp import TDVP, _stack_components
 from ..nn import Sequential
+from ..nn._cuda_support import cuda_capability, supports_tuned_kernels, triton_runtime_issue, validated_ada_res_sum
 from ..sampler import Samples
 
 
@@ -20,10 +21,22 @@ def _gram_tile(T):
     # On the tested consumer CUDA architecture, FP64 GEMM is expensive
     # enough to benefit from not computing both halves of a large Gram.
     n = T.shape[0]
-    if (512 <= n <= 4096 and T.dtype == torch.float64 and T.is_cuda and torch.version.cuda is not None
-            and torch.cuda.get_device_capability(T.device) == (12, 0)):
+    if 512 <= n <= 4096 and T.dtype == torch.float64 and cuda_capability(T.device) == (12, 0):
         return 128 if n <= 1024 else 256
     return 0
+
+
+def _ada_ordinary_res_sum(state, nsamples, channels):
+    return (cuda_capability(state.device) == (8, 9) and state.dtype == torch.float64
+            and state.nsymm == 1 and len(state.ansatz) == 1 and not torch.is_autocast_enabled("cuda")
+            and validated_ada_res_sum(getattr(state.ansatz[0], "config", None),
+                                     getattr(state.symm.sites, "shape", ()), nsamples, state.max_parallel,
+                                     channels=channels)
+            and all(p.dtype == torch.float32 for p in state.parameters()))
+
+
+def _ada_gram_syrk(state, T):
+    return T.dtype == torch.float64 and _ada_ordinary_res_sum(state, T.shape[0], (16,))
 
 
 def _active_params(module):
@@ -69,6 +82,10 @@ class MinSR(TDVP):
         self.process_group = process_group
         self._layers = tuple(_block_layers(net) for net in state.ansatz)
         self._complex_params = any(p.is_complex() for p in state.parameters())
+        self._vjp_backends = set()
+        self._gram_backends = set()
+        self._ada_gram_requested = False
+        self._last_cache_plan = (None, None)
 
     @torch.no_grad()
     def _prepare(self, spins):
@@ -122,12 +139,15 @@ class MinSR(TDVP):
         return positions, real, imag
 
     @torch.no_grad()
-    def _block_vjp(self, block, x, delta_real, delta_imag, propagate):
+    def _block_vjp(self, block, x, delta_real, delta_imag, propagate, *, ada_weight_grad=False):
         if delta_imag is None and not self._complex_params:
-            result = batched_res_sum_vjp(block, x, delta_real, propagate, self.state.max_parallel)
+            result = batched_res_sum_vjp(block, x, delta_real, propagate, self.state.max_parallel,
+                                         ada_weight_grad=ada_weight_grad)
             if result is not None:
-                jac, upstream = result
+                jac, upstream, periodic = result
+                self._vjp_backends.add("periodic weight gradient" if periodic else "batched unfold")
                 return jac, upstream, None
+        self._vjp_backends.add("generic autograd")
         params = _active_params(block)
 
         def backward_one(x, real, imag=None):
@@ -155,6 +175,8 @@ class MinSR(TDVP):
 
     def _native_jacobian_blocks(self, spins):
         spins = torch.as_tensor(spins, device=self.state.device)
+        ada_weight_grad = (self.process_group is None and _ada_ordinary_res_sum(self.state, len(spins), (32,))
+                           and triton_runtime_issue() is None)
         positions, real, imag = self._prepare(spins)
         block_index = sum(len(blocks) for _, blocks, _ in self._layers)
         for i in reversed(range(len(self._layers))):
@@ -163,7 +185,8 @@ class MinSR(TDVP):
             im = imag[i] if imag else None
             for j in reversed(range(len(blocks))):
                 block_index -= 1
-                jac, r, im = self._block_vjp(blocks[j], positions[i][j], r, im, propagate=j > 0)
+                jac, r, im = self._block_vjp(blocks[j], positions[i][j], r, im, propagate=j > 0,
+                                             ada_weight_grad=ada_weight_grad)
                 yield block_index, jac
 
     def jacobian_blocks(self, spins):
@@ -183,7 +206,10 @@ class MinSR(TDVP):
         group = self.process_group
         rank = 0 if group is None else distributed.get_rank(group)
         world = 1 if group is None else distributed.get_world_size(group)
-        tile = _gram_tile(T) if group is None and self.vs_type == 0 else 0
+        real_single_device = group is None and self.vs_type == 0
+        tile = _gram_tile(T) if real_single_device else 0
+        ada_syrk = real_single_device and _ada_gram_syrk(self.state, T)
+        self._ada_gram_requested = ada_syrk
         mirror = False
         lower_only = False
         blocks = self._native_jacobian_blocks if _native_cache else self.jacobian_blocks
@@ -192,17 +218,20 @@ class MinSR(TDVP):
             means.append((jac * samples.reweight_factor[:, None]).mean(dim=0))
             if i % world == rank:
                 block = self._normalized_block(jac, samples.reweight_factor)
-                if tile and block.shape[1] >= 4096:
-                    if 512 <= size <= 1024 and add_gram_lower_(T, block):
-                        lower_only = True
-                    else:
-                        # Below-diagonal tile columns plus full diagonal tiles.
-                        for start in range(0, size, tile):
-                            end = min(start + tile, size)
-                            T[start:, start:end].addmm_(block[start:], block[start:end].mT)
-                        mirror = True
+                wide = block.shape[1] >= 4096
+                if wide and (tile or ada_syrk) and 512 <= size <= 1024 and add_gram_lower_(T, block):
+                    lower_only = True
+                    self._gram_backends.add("cuBLAS SYRK")
+                elif wide and tile:
+                    # Below-diagonal tile columns plus full diagonal tiles.
+                    for start in range(0, size, tile):
+                        end = min(start + tile, size)
+                        T[start:, start:end].addmm_(block[start:], block[start:end].mT)
+                    mirror = True
+                    self._gram_backends.add("tiled GEMM")
                 else:
                     T.addmm_(block, block.mH)
+                    self._gram_backends.add("full GEMM")
                 if _blocks is not None and (_retain_before is None or i < _retain_before):
                     _blocks.append(raw if _native_cache else block)
         if not means:
@@ -276,9 +305,12 @@ class MinSR(TDVP):
 
     @torch.no_grad()
     def get_step(self, samples):
+        self._vjp_backends.clear()
+        self._gram_backends.clear()
         samples = self._gather_samples(samples)
         Ebar = self.get_Ebar(samples)
         cache, retain_before = self._cache_plan(samples, Ebar.element_size())
+        self._last_cache_plan = cache, retain_before
         if cache is None:
             T = self.get_Tmat(samples)
             step = self.solve(samples, T, Ebar)
@@ -302,3 +334,28 @@ class MinSR(TDVP):
                 step_blocks.extend(self._adjoint_blocks(samples, v, total_blocks - retain_before))
             step = torch.cat(step_blocks)
         return self.build_step(step, self._Omean, self.energy)
+
+    def log_backends(self, logger):
+        vjp = ", ".join(sorted(self._vjp_backends))
+        if "periodic weight gradient" not in self._vjp_backends:
+            if cuda_capability(self.state.device) == (8, 9):
+                vjp += " (periodic weight gradient requires the validated sm_89 shape and Triton runtime)"
+            elif supports_tuned_kernels(self.state.device):
+                vjp += " (periodic weight-gradient requirements were not met)"
+            else:
+                vjp += " (periodic weight gradient unavailable on this device/runtime)"
+        gram = ", ".join(sorted(self._gram_backends))
+        if self._gram_backends == {"full GEMM"}:
+            if self._ada_gram_requested:
+                gram += " (no block qualified for cuBLAS SYRK)"
+            elif cuda_capability(self.state.device) == (8, 9):
+                gram += " (outside the validated sm_89 triangular Gram range)"
+            else:
+                gram += " (triangular Gram requirements were not met)"
+        cache, retained = self._last_cache_plan
+        cache_status = "off"
+        if cache is not None:
+            blocks = "all blocks" if retained is None else f"{retained} blocks"
+            cache_status = f"{cache}, {blocks}"
+        logger.info("CUDA MinSR derivatives: %s | derivative cache: %s", vjp, cache_status)
+        logger.info("CUDA MinSR Gram: %s", gram)

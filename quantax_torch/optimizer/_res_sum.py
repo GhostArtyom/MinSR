@@ -82,7 +82,7 @@ def _reverse(block, x, delta, propagate, weight_grad, orbit):
     return torch.cat([g for layer_grads in reversed(gradients) for g in layer_grads], dim=1), delta
 
 
-def batched_res_sum_vjp(block, x, delta, propagate, max_parallel):
+def batched_res_sum_vjp(block, x, delta, propagate, max_parallel, *, ada_weight_grad=False):
     if (
         x.device.type != "cuda" or x.ndim != 5 or not 1 <= x.shape[1] <= 16 or x.dtype != torch.float32
         or type(block) is not Sequential or not len(block) or not _unhooked(block)
@@ -99,7 +99,7 @@ def batched_res_sum_vjp(block, x, delta, propagate, max_parallel):
     weight_grad = None
     if (sites <= 100 and delta.dtype == x.dtype and not torch.is_autocast_enabled("cuda")
             and all(max(conv.kernel_size) <= 5 and conv.weight.shape[0] <= 64 for conv in convolutions)
-            and supports_tuned_kernels(x.device)):
+            and (ada_weight_grad or supports_tuned_kernels(x.device))):
         from ._res_sum_cuda import periodic_weight_grad
 
         weight_grad = periodic_weight_grad
@@ -127,4 +127,4 @@ def batched_res_sum_vjp(block, x, delta, propagate, max_parallel):
         grads.append(grad)
         if propagate:
             upstream.append(d_input.unflatten(0, features.shape[:2]))
-    return torch.cat(grads), torch.cat(upstream) if propagate else None
+    return torch.cat(grads), torch.cat(upstream) if propagate else None, weight_grad is not None

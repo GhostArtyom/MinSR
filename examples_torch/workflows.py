@@ -9,23 +9,59 @@ import matplotlib.pyplot as plt
 import torch
 
 import quantax_torch as qtx
-from quantax_torch.nn._cuda_support import supports_tuned_kernels
+from quantax_torch.nn._cuda_support import cuda_capability, triton_runtime_issue, validated_ada_res_sum
 from quantax_torch.utils import (
     DataTracer, close_run, create_run, log_devices, log_progress, save_training_plots, setup_plot_font,
 )
 
 
-def _cuda_inference(config, device, symmetric):
+def _validated_ada_config(config):
+    return (
+        validated_ada_res_sum(config.network, (config.L, config.L, 1), config.nsamples, config.max_parallel)
+        and qtx.get_params_dtype() == torch.float32 and qtx.get_default_dtype() == torch.float64
+        and not torch.is_autocast_enabled("cuda")
+    )
+
+
+def _periodic_forward_issue(config, device, symmetric):
+    if not (config.projected_periodic_conv if symmetric else config.ordinary_periodic_conv):
+        return "disabled in configuration"
+    capability = cuda_capability(device)
+    if capability is None:
+        return "requires NVIDIA CUDA"
+    if capability == (8, 9):
+        if not _validated_ada_config(config) or (symmetric and config.projected_forward_batch != 1024):
+            return "configuration is outside the validated sm_89 periodic forward range"
+        return triton_runtime_issue()
+    if capability != (12, 0):
+        return f"periodic forward is not enabled on sm_{capability[0]}{capability[1]}"
     # On the tested device, even 2×2 kernels benefit from avoiding periodic
     # padding across a range of widths. Larger kernels still use the regular
     # channel tiles; leave other ordinary shapes to channels-last cuDNN.
     plain_shape = ((config.kernel_size == 2 and 8 <= config.channels <= 64)
                    or (config.kernel_size >= 3 and config.channels % 16 == 0))
-    enabled = config.projected_periodic_conv if symmetric else (config.ordinary_periodic_conv and plain_shape)
-    if enabled and supports_tuned_kernels(device):
-        from quantax_torch.nn._periodic_cuda import res_sum_forward
+    if not symmetric and not plain_shape:
+        return "ordinary convolution shape is outside the tuned range"
+    return triton_runtime_issue()
 
-        return res_sum_forward
+
+def _cuda_inference(config, device, symmetric):
+    if _periodic_forward_issue(config, device, symmetric) is not None:
+        return None
+    from quantax_torch.nn._periodic_cuda import res_sum_forward
+
+    return res_sum_forward
+
+
+def _local_energy_graph_issue(config, device, inference):
+    if not config.projected_local_energy_graph:
+        return "disabled in configuration"
+    if inference is None:
+        return "periodic forward is unavailable"
+    if cuda_capability(device) == (8, 9) and (
+        not _validated_ada_config(config) or config.projected_forward_batch != 1024
+    ):
+        return "configuration is outside the validated sm_89 local-energy replay range"
     return None
 
 
@@ -39,9 +75,11 @@ def _system(config, symmetric, checkpoint=None):
     qtx.set_random_seed(config.seed)
     qtx.sites.Square(config.L)
     inference = _cuda_inference(config, device, symmetric)
+    local_energy_graph = symmetric and _local_energy_graph_issue(config, device, inference) is None
     hamiltonian = qtx.operator.Heisenberg(
         J=[config.J1, config.J2], n_neighbor=[1, 2], msr=True,
-        local_energy_graph=symmetric and inference is not None and config.projected_local_energy_graph,
+        local_energy_graph=local_energy_graph,
+        reuse_local_energy_pool=local_energy_graph and cuda_capability(device) == (8, 9),
     )
     symm = qtx.symmetry.TotalSz()
     if symmetric:
@@ -87,6 +125,9 @@ def _header(logger, config, state, steps, thermal, sweep, symmetric, reweight, c
         logger.info("CUDA inference batch: %d network inputs including orbit members", state.forward_batch)
     if state.inference_fn is not None:
         logger.info("CUDA forward: IEEE FP32 periodic convolution with fused operations where supported")
+    elif state.device.type == "cuda":
+        reason = _periodic_forward_issue(config, state.device, symmetric)
+        logger.info("CUDA forward: PyTorch/cuDNN (%s)", reason)
     logger.info("Network: ResSum %s", config.network)
     logger.info("Symmetry: %s", _sector(symmetric))
     logger.info("PyTorch %s | seed=%d", torch.__version__, config.seed)
@@ -101,6 +142,35 @@ def _sampler(config, state, reweight, thermal, sweep):
         cuda_graph=state.nsymm == 1 or config.projected_exchange_graph,
         skip_unchanged=state.device.type == "cuda" and state.nsymm > 1,
     )
+
+
+def _log_cuda_paths(logger, config, state, sampler, hamiltonian, optimizer=None):
+    if state.device.type != "cuda":
+        return
+    if sampler._compact_key is not None:
+        logger.info("CUDA sampling: compacted exchange graph replay")
+    elif sampler._cuda_graph is not None:
+        logger.info("CUDA sampling: ordinary exchange graph replay")
+    elif state.nsymm > 1:
+        if not config.projected_exchange_graph:
+            reason = "disabled in configuration"
+        elif state.inference_fn is None:
+            reason = "periodic forward is unavailable"
+        elif cuda_capability(state.device) == (8, 9) and sampler._compact_backend() is None:
+            reason = "compacted exchange requirements were not met on sm_89"
+        else:
+            reason = "capture requirements were not met or there were no proposals"
+        logger.info("CUDA sampling: eager compacted exchange (%s)", reason)
+    if state.nsymm > 1:
+        if getattr(hamiltonian, "_local_energy_graph_used", False):
+            pool = " with a reused capture pool" if hamiltonian._local_energy_workspaces else ""
+            logger.info("CUDA local energy: graph replay of full exchange batches%s", pool)
+        else:
+            reason = _local_energy_graph_issue(config, state.device, state.inference_fn)
+            reason = reason or "capture requirements were not met or fewer than 32 full batches"
+            logger.info("CUDA local energy: eager exchange batches (%s)", reason)
+    if optimizer is not None:
+        optimizer.log_backends(logger)
 
 
 def train(config, *, steps, param_file=None, symmetric=False, thermal_steps=None, sweep_steps=None):
@@ -129,12 +199,12 @@ def train(config, *, steps, param_file=None, symmetric=False, thermal_steps=None
         for n in range(1, steps + 1):
             step_start = perf_counter()
             samples = sampler.sweep()
-            if n == 1 and sampler._compact_key is not None:
-                logger.info("CUDA sampling: compacted exchange graph replay")
             update = optimizer.get_step(samples)
             if not bool(update.isfinite().all()):
                 raise FloatingPointError(f"Non-finite update at step {n}.")
             state.update(update * config.step_size)
+            if n == 1:
+                _log_cuda_paths(logger, config, state, sampler, hamiltonian, optimizer)
             energy, variance = optimizer.energy.item(), optimizer.VarE.item()
             energies.append(energy)
             variances.append(variance)
@@ -178,6 +248,8 @@ def measure(config, *, steps, param_file, preset=None, thermal_steps=None, sweep
             for i in range(1, steps + 1):
                 step_start = perf_counter()
                 energy, second = hamiltonian.expectation(state, sampler.sweep(), return_var=True)
+                if i == 1:
+                    _log_cuda_paths(logger, config, state, sampler, hamiltonian)
                 sum_energy += energy
                 sum_second += second
                 mean_energy = sum_energy / i
@@ -193,6 +265,7 @@ def measure(config, *, steps, param_file, preset=None, thermal_steps=None, sweep
             "inference_batch": state.forward_batch,
             "projected_periodic_conv": state.inference_fn is not None,
             "projected_exchange_graph": sampler._compact_key is not None,
+            "projected_local_energy_graph": getattr(hamiltonian, "_local_energy_graph_used", False),
             "thermal_steps": thermal, "sweep_steps": sweep,
             "energy": mean_energy, "energy_per_site": mean_energy / config.L**2, "variance": mean_variance,
             "seconds": perf_counter() - start, "seed": config.seed, "device": str(state.device),

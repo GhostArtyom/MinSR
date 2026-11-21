@@ -8,7 +8,7 @@ from ..sampler import Samples
 from ..state import Variational
 
 
-def _replay_exchange(accumulate, rows, terms, chunk, result, maximum):
+def _replay_exchange(accumulate, rows, terms, chunk, result, maximum, *, workspaces=None):
     """Replay four full inference batches at once for this local-energy call."""
     batches = 4
     count = batches * chunk
@@ -17,7 +17,9 @@ def _replay_exchange(accumulate, rows, terms, chunk, result, maximum):
     device = rows.device
     with torch.cuda.device(device):
         current = torch.cuda.current_stream(device)
-        stream = torch.cuda.Stream(device=device)
+        previous = None if workspaces is None else workspaces.get(current)
+        stream = torch.cuda.Stream(device=device) if previous is None else previous[0]
+        pool = None if previous is None else previous[1].pool()
         saved_maximum = maximum.clone()
         scratch = torch.zeros_like(result)
         stream.wait_stream(current)
@@ -32,7 +34,7 @@ def _replay_exchange(accumulate, rows, terms, chunk, result, maximum):
         # allocator cache. That penalizes the MinSR allocations after Oloc
         # when a new graph is captured on every step.
         with torch.cuda.stream(stream):
-            graph.capture_begin()
+            graph.capture_begin(pool=pool)
             try:
                 for source, bond in zip(src.unbind(), term.unbind(), strict=True):
                     accumulate(result, source, bond)
@@ -43,16 +45,23 @@ def _replay_exchange(accumulate, rows, terms, chunk, result, maximum):
             src.copy_(rows[i:i + count].view_as(src))
             term.copy_(terms[i:i + count].view_as(term))
             graph.replay()
+        # Keep the pool alive until the next capture on this caller stream.
+        # Replays are ordered and result was allocated outside the pool.
+        if workspaces is not None:
+            workspaces[current] = stream, graph
     return end
 
 
 class _Heisenberg(Operator):
-    def __init__(self, terms, *, local_energy_graph):
+    def __init__(self, terms, *, local_energy_graph, reuse_local_energy_pool=False):
         super().__init__(terms)
         self.local_energy_graph = local_energy_graph
+        self._local_energy_graph_used = False
+        self._local_energy_workspaces = {} if reuse_local_energy_pool else None
 
     @torch.no_grad()
     def psiOloc(self, state, samples):
+        self._local_energy_graph_used = False
         if not isinstance(samples, Samples):
             spins = torch.as_tensor(samples, device=state.device)
             samples = Samples(spins, state(spins))
@@ -97,7 +106,9 @@ class _Heisenberg(Operator):
                 and state.nsymm > 1 and state.inference_fn is not None
                 and state._default_input and state._default_output
                 and rows.numel() >= 32 * chunk and not torch.are_deterministic_algorithms_enabled()):
-            start = _replay_exchange(accumulate, rows, terms, chunk, result, state._maximum)
+            start = _replay_exchange(accumulate, rows, terms, chunk, result, state._maximum,
+                                     workspaces=self._local_energy_workspaces)
+            self._local_energy_graph_used = start > 0
         for src, term in zip(rows[start:].split(chunk), terms[start:].split(chunk), strict=True):
             if src.numel():
                 accumulate(result, src, term)
@@ -107,7 +118,7 @@ class _Heisenberg(Operator):
         return result
 
 
-def Heisenberg(J=1.0, n_neighbor=1, msr=False, *, local_energy_graph=False):
+def Heisenberg(J=1.0, n_neighbor=1, msr=False, *, local_energy_graph=False, reuse_local_energy_pool=False):
     """Build a Heisenberg operator; graph replay requires a capture-safe inference backend."""
     J = [J] if isinstance(J, Number) else J
     shells = [n_neighbor] if isinstance(n_neighbor, int) else n_neighbor
@@ -122,7 +133,7 @@ def Heisenberg(J=1.0, n_neighbor=1, msr=False, *, local_energy_graph=False):
         exchange.extend([2 * sign * coupling, i, j] for i, j in bonds)
     terms = [["zz", diag], ["+-", exchange], ["-+", exchange]]
     if all(i != j for _, i, j in diag):
-        return _Heisenberg(terms, local_energy_graph=local_energy_graph)
+        return _Heisenberg(terms, local_energy_graph=local_energy_graph, reuse_local_energy_pool=reuse_local_energy_pool)
     return Operator(terms)
 
 
