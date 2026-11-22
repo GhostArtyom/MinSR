@@ -79,7 +79,7 @@ def _system(config, symmetric, checkpoint=None):
     hamiltonian = qtx.operator.Heisenberg(
         J=[config.J1, config.J2], n_neighbor=[1, 2], msr=True,
         local_energy_graph=local_energy_graph,
-        reuse_local_energy_pool=local_energy_graph and cuda_capability(device) == (8, 9),
+        reuse_local_energy_pool=local_energy_graph,
     )
     symm = qtx.symmetry.TotalSz()
     if symmetric:

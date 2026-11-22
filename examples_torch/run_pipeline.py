@@ -125,7 +125,7 @@ def _worker(stage, connection, checkpoint, config, options):
     steps = options["steps"]
     with connection:
         if stage == "train":
-            run = module.main(config=config, **options)
+            run = module.main(config=config, param_file=checkpoint, **options)
             result = run / f"params_{steps}.pt"
         elif stage == "train_symm":
             run = module.main(checkpoint, config=config, **options)
@@ -162,14 +162,17 @@ def _run_stage(stage, checkpoint, config, options):
             process.close()
 
 
-def main(config=None, *, steps=None, symm_steps=None, measure_steps=None, from_checkpoint=FROM_CHECKPOINT):
+def main(config=None, *, steps=None, symm_steps=None, measure_steps=None, from_checkpoint=FROM_CHECKPOINT,
+         initial_weights=None):
+    if initial_weights is not None and from_checkpoint is not None:
+        raise ValueError("Choose either initial weights or a finished ordinary training checkpoint.")
     config = Config() if config is None else config
     stages = {
         stage: _stage_options(stage, config, length)
         for stage, length in (("train", steps), ("train_symm", symm_steps), ("measure", measure_steps))
     }
     if from_checkpoint is None:
-        checkpoint = _run_stage("train", None, *stages["train"])
+        checkpoint = _run_stage("train", initial_weights, *stages["train"])
         print(f"Training checkpoint: {checkpoint}", flush=True)
     else:
         checkpoint = Path(from_checkpoint).expanduser().resolve()
@@ -188,7 +191,13 @@ if __name__ == "__main__":
     parser.add_argument("--steps", type=int)
     parser.add_argument("--symm-steps", type=int)
     parser.add_argument("--measure-steps", type=int)
-    parser.add_argument("--from-checkpoint", type=Path, default=FROM_CHECKPOINT)
+    weights = parser.add_mutually_exclusive_group()
+    weights.add_argument("--from-checkpoint", type=Path, default=FROM_CHECKPOINT,
+                         help="Skip ordinary training and start with its final checkpoint.")
+    weights.add_argument("--initial-weights", type=Path,
+                         help="Load these weights before the first ordinary training step.")
     args = vars(parser.parse_args())
-    controls = {key: args.pop(key) for key in ("steps", "symm_steps", "measure_steps", "from_checkpoint")}
+    controls = {key: args.pop(key) for key in (
+        "steps", "symm_steps", "measure_steps", "from_checkpoint", "initial_weights",
+    )}
     main(Config(**args), **controls)

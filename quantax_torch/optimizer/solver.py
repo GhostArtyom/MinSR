@@ -24,6 +24,8 @@ def _sum_without_noise(inputs, tol_snr):
 
 def minsr_pinv_eig(tol=None, atol=0.0, tol_snr=0.0):
     def solve(T, b):
+        if not bool(T.isfinite().all() & b.isfinite().all()):
+            raise FloatingPointError("Non-finite matrix or right-hand side in the MinSR solve.")
         vals, U = torch.linalg.eigh(T)
         inverse = _get_eigs_inv(vals, tol, atol)
         rhs = U.mH @ b if tol_snr <= 1e-6 else _sum_without_noise(U.conj() * b[:, None], tol_snr)

@@ -2,6 +2,22 @@
 
 MinSR is the reproduction repository for *Empowering deep neural quantum states through efficient optimization*. The importable Python package is `quantax`; `MinSR` is the optimizer. Work against the API in this checkout rather than assuming compatibility with newer Quantax releases.
 
+## Global Preferences
+
+### Editing
+
+- Search with `rg`/`rg --files`; make manual edits with `apply_patch`, not Python replacement scripts.
+- Keep changes scoped, preserve unrelated user edits, run appropriate checks, and review the final diff.
+
+### Writing and Mathematics
+
+- Keep prose paragraphs on one physical line. Leave one space after a bold label ending in punctuation.
+- Use ASCII `/` (U+002F) for all forward slashes you write, including in Chinese prose, headings, tables, chat replies, paths, links, URLs, commands, and code. Do not use the fullwidth slash (U+FF0F). Preserve exact quotations and verbatim source text.
+- Add one space between Chinese characters and adjacent English letters or numbers, never between Chinese characters, beside Chinese punctuation, or at line boundaries. Check both boundaries of edited Markdown links using the adjacent visible characters, ignoring link markup.
+- Use `$...$` and `$$...$$` for math, not `\(...\)` or `\[...\]`. Leave standalone numbers in prose, tables, and time ranges as plain text; use math delimiters for variables and operations.
+- Use `\ket{...}` and `\bra{...}` for bra-ket notation; include `\usepackage{braket}` in LaTeX preambles.
+- In Markdown math, use `\mathrm{...}` for upright Roman text. It controls font style, not operator semantics; do not mechanically replace LaTeX `\operatorname{...}` with it.
+
 ## Repository guide
 
 - [`quantax/`](quantax/) contains the implementation. Start with [`quantax/optimizer/minsr.py`](quantax/optimizer/minsr.py) for MinSR and [`quantax/optimizer/tdvp.py`](quantax/optimizer/tdvp.py) for the shared optimization logic.

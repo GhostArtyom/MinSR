@@ -83,6 +83,14 @@ def check(reference):
                 np.testing.assert_allclose(actual, expected[name], rtol=rtol, atol=atol, err_msg=name)
                 print(f"{name}: max absolute difference {np.max(np.abs(actual - expected[name])):.3g}")
     state.update(1e-3 * step)
+    # JAX rounds the update to the parameter dtype before applying it.
+    params = next(state.parameters())
+    with torch.no_grad():
+        params.view(-1)[0] = 1.0
+    rounding_step = torch.zeros_like(step)
+    rounding_step[1] = 0.50000003
+    state.update(rounding_step, rescale=False)
+    assert params.view(-1)[0] == 1.0 - rounding_step[1].to(params.dtype)
     sampler = qtx.sampler.NeighborExchange(state, 8, n_neighbor=[1, 2], thermal_steps=1, sweep_steps=2)
     sampled = sampler.sweep()
     assert (sampled.spins.sum(dim=1) == 0).all()
@@ -334,6 +342,7 @@ def check_projected_local_energy_replay():
     fast, state = _system(config, True)
     reference, _ = _system(replace(config, projected_local_energy_graph=False), True)
     spins = qtx.utils.rand_spins(8, 0, device=state.device)
+    pool = None
     for n in range(2):
         if n:
             update = torch.linspace(-0.003, 0.003, state.nparams + 1, device=state.device, dtype=state.dtype)
@@ -346,12 +355,15 @@ def check_projected_local_energy_replay():
         with patch.object(common_operators, "_replay_exchange", wraps=common_operators._replay_exchange) as replay:
             actual = fast.Oloc(state, samples)
             assert replay.called
+        _, graph = fast._local_energy_workspaces[torch.cuda.current_stream(spins.device)]
+        assert pool is None or graph.pool() == pool
+        pool = graph.pool()
         torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-11)
         torch.testing.assert_close(state._maximum, max_expected, rtol=0, atol=0)
     # Fully polarized spins have no exchanges and need no graph capture.
     polarized = torch.ones_like(spins[:1])
     torch.testing.assert_close(fast.Oloc(state, polarized), reference.Oloc(state, polarized), rtol=0, atol=0)
-    print("Whole-batch local energy replay agrees with eager before and after a weight update.")
+    print("Local energy replay reuses its capture pool and agrees with eager after a weight update.")
 
 
 def check_projected_vjp():

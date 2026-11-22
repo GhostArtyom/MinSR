@@ -1,0 +1,27 @@
+{
+  "system": "j1j2_square_10x10_J1-1_J2-0.5",
+  "network_idx": null,
+  "network": {
+    "depth": 16,
+    "channels": 16,
+    "kernel_size": 3,
+    "use_sinh": true
+  },
+  "param_file": "/home/ghost/Code/MinSR/runs/torch-perf/eigh-diagnosis/torch-jax-cuda-init-2347-20261122_153200/j1j2_square_10x10_J1-1_J2-0.5/20261122_160638/params_symm_1000.pt",
+  "symmetry": "TotalSz(0) + SpinInverse() + C4v()",
+  "nsamples": 1000,
+  "steps": 100,
+  "max_parallel": 32768,
+  "inference_batch": 1024,
+  "projected_periodic_conv": true,
+  "projected_exchange_graph": true,
+  "projected_local_energy_graph": true,
+  "thermal_steps": 10000,
+  "sweep_steps": 1000,
+  "energy": -198.83452639971097,
+  "energy_per_site": -1.9883452639971098,
+  "variance": 4.757374436543614,
+  "seconds": 2259.3209520539967,
+  "seed": 2347,
+  "device": "cuda"
+}

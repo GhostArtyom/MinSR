@@ -201,7 +201,9 @@ class Variational(State):
                 p.copy_(value)
         else:
             for p, delta in zip(params, self.get_params_unflatten(step[1:])):
-                p.sub_(delta if p.is_complex() else delta.real)
+                # Match the reference: round the update before applying it.
+                delta = delta if p.is_complex() else delta.real
+                p.sub_(delta.to(p.dtype))
 
     def rescale(self):
         self.update_theta0(0)
