@@ -1,4 +1,4 @@
-"""Check JAX kernels and two small MinSR updates.
+"""Check JAX kernels and two small MinSR updates on CUDA or CPU.
 
 Use --jax-only to skip QuSpin/Quantax. Set JAX_PLATFORMS=cpu for a CPU check.
 """

@@ -25,31 +25,13 @@ Related links:
 
 ## Installation
 
-The repository provides two independent uv environments for Linux, including Fedora on WSL 3.x. Each directory contains its own `pyproject.toml`, `uv.lock`, and `.python-version`:
+The repository provides three independent uv environments for Linux x86-64, including Fedora on WSL 3.x. PyTorch is the default project at the repository root. Install the system dependencies and build the QuSpin wheel for the selected Python version before syncing.
 
-| Project directory | Python | JAX | cuDNN |
+| Project directory | Python | Backend | Environment directory |
 | --- | --- | --- | --- |
-| `environments/py39-jax0425/` | 3.9 | 0.4.25 | 8 |
-| `environments/py311-jax062/` | 3.11 | 0.6.2 | 9 |
-
-Both use official PyPI (`https://pypi.org/simple`); PyPI artifacts download from `https://files.pythonhosted.org`. The historical GPU JAX wheel comes from Google's official archive, and QuSpin is built locally.
-
-From the repository root, install the environment selected for the detected GPU:
-
-```bash
-uv run --no-project scripts/uv_machine.py sync --locked
-```
-
-The helper selects a project under `environments/` and installs its dependencies into the root `.venv/`. Each project keeps its own configuration and lockfile. For notebooks, select `.venv/bin/python`.
-
-To choose an environment explicitly:
-
-```bash
-uv run --no-project scripts/uv_machine.py --environment py39-jax0425 sync --locked
-uv run --no-project scripts/uv_machine.py --environment py311-jax062 sync --locked
-```
-
-Run only the command for the environment you intend to use.
+| [`./`](#python-311--pytorch-2100) | 3.11 | PyTorch 2.10.0 / CUDA 12.8 | `.venv/` |
+| [`environments/py39-jax0425/`](#python-39--jax-0425) | 3.9 | JAX 0.4.25 / cuDNN 8 | `environments/py39-jax0425/.venv/` |
+| [`environments/py311-jax062/`](#python-311--jax-062) | 3.11 | JAX 0.6.2 / cuDNN 9 | `environments/py311-jax062/.venv/` |
 
 ### System requirements
 
@@ -66,7 +48,7 @@ Package availability depends on the release and enabled repositories. GCC is the
 
 ### Build QuSpin
 
-Build the historical QuSpin commit with the Python ABI of the selected environment. For the Python 3.11 / JAX 0.6.2 environment:
+Run the build commands from the repository root. The JAX and PyTorch projects on Python 3.11 share the same QuSpin wheel. For Python 3.9, follow the substitutions in the [JAX 0.4.25 section](#python-39--jax-0425).
 
 ```bash
 git clone --filter=blob:none https://github.com/QuSpin/QuSpin.git ../QuSpin
@@ -77,7 +59,7 @@ uv pip install --python ../QuSpin/.venv-py311/bin/python \
     "setuptools==68.2.2" "wheel==0.41.2"
 ```
 
-Skip cloning if `../QuSpin` already exists. This commit reports version 0.3.7. With recent Boost headers, change the Linux `-std=c++11` option in `../QuSpin/quspin/basis/basis_general/_basis_general_core/setup.py` to `-std=c++14`. The explicit option overrides `CXXFLAGS`.
+Skip cloning if `../QuSpin` already exists. This commit reports version 0.3.7. With recent Boost headers, change the Linux `-std=c++11` option in [`../QuSpin/quspin/basis/basis_general/_basis_general_core/setup.py`](https://github.com/QuSpin/QuSpin/blob/fc03e08/quspin/basis/basis_general/_basis_general_core/setup.py) to `-std=c++14`. The explicit option overrides `CXXFLAGS`.
 
 ```bash
 (
@@ -88,7 +70,7 @@ Skip cloning if `../QuSpin` already exists. This commit reports version 0.3.7. W
 )
 ```
 
-Reduce parallelism if memory is limited. Clang also requires a working OpenMP runtime. The resulting wheel must remain at `../QuSpin/dist/quspin-0.3.7-cp311-cp311-linux_x86_64.whl`. Rebuild on each target machine when its Python ABI, CPU instructions, glibc/libstdc++, or OpenMP runtime differs.
+Reduce parallelism if memory is limited. Clang also requires a working OpenMP runtime. Keep the wheel at the location declared in the [PyTorch project](pyproject.toml) and the [Python 3.11 JAX project](environments/py311-jax062/pyproject.toml). Rebuild on each target machine when its Python ABI, CPU instructions, glibc/libstdc++, or OpenMP runtime differs.
 
 ### Python 3.11 / JAX 0.6.2
 
@@ -103,12 +85,11 @@ uv run --no-project scripts/uv_machine.py --environment py311-jax062 sync --lock
 After the local wheel has been registered, routine use from the repository root is:
 
 ```bash
-source .venv/bin/activate
-uv run --active --locked --project environments/py311-jax062 python scripts/check_gpu.py
-uv run --active --locked --project environments/py311-jax062 python examples/train.py
+environments/py311-jax062/.venv/bin/python -m scripts.check_jax
+environments/py311-jax062/.venv/bin/python -m examples.train
 ```
 
-The `--active` option uses the activated root `.venv/`. In a notebook editor, select `.venv/bin/python`; `ipykernel` is included. Adjust `max_parallel` and sample counts for the available GPU memory before running the full training example.
+In a notebook editor, select `environments/py311-jax062/.venv/bin/python`. The environment includes `ipykernel`. Adjust `max_parallel` and sample counts for the available GPU memory before running the full training example.
 
 Add `--jax-only` to check JAX kernels without importing QuSpin or Quantax. Set `JAX_PLATFORMS=cpu` for a CPU check.
 
@@ -116,20 +97,49 @@ The GPU check covers a JIT elementwise operation, convolution, float64 eigensolv
 
 ### Python 3.9 / JAX 0.4.25
 
-For this environment, repeat the QuSpin build with Python 3.9, a build environment such as `../QuSpin/.venv-py39`, and `--build-base build-py39`. The wheel must be `../QuSpin/dist/quspin-0.3.7-cp39-cp39-linux_x86_64.whl`. Register the target machine's wheel and use the independent project:
+For this environment, repeat the QuSpin build with Python 3.9, a build environment such as `../QuSpin/.venv-py39`, and `--build-base build-py39`. Keep the wheel at the location declared in the [Python 3.9 JAX project](environments/py39-jax0425/pyproject.toml). Register the target machine's wheel and use the independent project:
 
 ```bash
 uv run --no-project scripts/uv_machine.py --environment py39-jax0425 remove --no-sync quspin
 uv run --no-project scripts/uv_machine.py --environment py39-jax0425 add --no-sync ../QuSpin/dist/quspin-0.3.7-cp39-cp39-linux_x86_64.whl
 uv run --no-project scripts/uv_machine.py --environment py39-jax0425 sync --locked
-source .venv/bin/activate
-uv run --active --locked --project environments/py39-jax0425 python scripts/check_gpu.py
-uv run --active --locked --project environments/py39-jax0425 python examples/train.py
+environments/py39-jax0425/.venv/bin/python -m scripts.check_jax
+environments/py39-jax0425/.venv/bin/python -m examples.train
 ```
 
-Run these commands from the repository root. The interpreter is `.venv/bin/python` after selecting and syncing this profile. This project installs the shared Quantax source in editable mode.
+Run these commands from the repository root. The JAX projects install the shared Quantax source in editable mode.
 
-Keep each project's configuration and lockfile together. Use `uv run --no-project scripts/uv_machine.py --environment py311-jax062 lock` or `uv run --no-project scripts/uv_machine.py --environment py39-jax0425 lock` to update only the intended lockfile. These projects are not workspace members; they maintain independent lockfiles.
+Once the wheel is registered, use the first command to select the JAX profile for the detected GPU and sync its own `.venv/`. The second command updates the selected lockfile. Substitute `py39-jax0425` to update the Python 3.9 profile. [JAX environment selector](scripts/uv_machine.py)
+
+```bash
+uv run --no-project scripts/uv_machine.py sync --locked
+uv run --no-project scripts/uv_machine.py --environment py311-jax062 lock
+```
+
+### Python 3.11 / PyTorch 2.10.0
+
+From the repository root, sync the PyTorch project. It uses the official PyTorch CUDA 12.8 index for Torch and installs the shared Python 3.11 QuSpin wheel together with its exact diagonalization dependencies.
+
+```bash
+uv sync --locked
+```
+
+If the rebuilt wheel has a different checksum, register it in the PyTorch project and retry the sync.
+
+```bash
+uv remove --no-sync quspin
+uv add --no-sync ../QuSpin/dist/quspin-0.3.7-cp311-cp311-linux_x86_64.whl
+uv sync --locked
+```
+
+Use the project interpreter to check CUDA availability and launch the training, symmetry training, and measurement pipeline.
+
+```bash
+.venv/bin/python -c 'import torch; assert torch.cuda.is_available()'
+.venv/bin/python -m examples_torch.run_pipeline --device cuda
+```
+
+Pass `--device cpu` to run on CPU. Pipeline configuration and standalone entry points are documented in the [PyTorch guide](docs/pytorch-migration-plan.md#安装和运行).
 
 ### CUDA compatibility and troubleshooting
 
@@ -137,12 +147,13 @@ Install the GPU driver on the host. Under WSL this means the Windows driver; do 
 
 Use `JAX_PLATFORMS=cpu` to select CPU execution. For GPU validation, the check scripts set `JAX_PLATFORMS=cuda` so initialization errors cannot silently fall back to CPU. Check whether `LD_LIBRARY_PATH` overrides the packaged CUDA libraries if library loading fails, while preserving required system or cluster paths.
 
-For missing headers, Boost standard errors, or `GLIBC_*` / `GLIBCXX_*` failures, install compatible development packages and rebuild QuSpin with the matching compiler. A local wheel is not automatically portable between machines. Download failures require access to official PyPI and, for the legacy JAX wheel, the Google archive.
+For missing headers, Boost standard errors, or `GLIBC_*` / `GLIBCXX_*` failures, install compatible development packages and rebuild QuSpin with the matching compiler. For download failures, check access to the package indexes recorded in the relevant lockfile, the Google archive for legacy JAX, or the PyTorch CUDA index for Torch.
 
 For `cannot enable executable stack` with the historical JAX wheel, install a `patchelf` version supporting `--clear-execstack` and patch local copies:
 
 ```bash
-for library in .venv/lib/python3.9/site-packages/jaxlib/xla_extension.so .venv/lib/python3.9/site-packages/jaxlib/cuda/*.so; do
+for library in environments/py39-jax0425/.venv/lib/python3.9/site-packages/jaxlib/xla_extension.so \
+    environments/py39-jax0425/.venv/lib/python3.9/site-packages/jaxlib/cuda/*.so; do
     cp "$library" "$library.local"
     mv "$library.local" "$library"
     patchelf --clear-execstack "$library"

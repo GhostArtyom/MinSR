@@ -768,7 +768,7 @@ name = "quspin"
 version = "0.3.7"
 source = { path = "../../../QuSpin/dist/quspin-0.3.7-cp39-cp39-linux_x86_64.whl" }
 wheels = [
-    { filename = "quspin-0.3.7-cp39-cp39-linux_x86_64.whl", hash = "sha256:73e7b52e9e3589477f0097c82992a1f3223d266d677c97cf688cf12c81e21e9e" },
+    { filename = "quspin-0.3.7-cp39-cp39-linux_x86_64.whl", hash = "sha256:d6632891ee8e05cf912112ce75b7c24badbad8f0eab2f990525ae0f23be4bdf0" },
 ]
 
 [[package]]

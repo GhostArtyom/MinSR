@@ -61,7 +61,7 @@ class Symmetry:
 
     @property
     def Nup(self):
-        return None if self.total_sz is None else (self.nsites + self.total_sz) // 2
+        return None if self.total_sz is None else int((self.nsites + self.total_sz) // 2)
 
     @property
     def basis(self):

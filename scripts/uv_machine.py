@@ -1,4 +1,4 @@
-"""Select a GPU-specific uv project and keep its environment at the repository root."""
+"""Select a JAX uv project for the detected GPU."""
 import argparse
 import os
 from pathlib import Path
@@ -47,9 +47,11 @@ def main():
     if executable is None:
         parser.error("uv is not installed or is missing from PATH")
     project = ROOT / "environments" / profile
+    venv = project / ".venv"
     env = os.environ.copy()
-    env["UV_PROJECT_ENVIRONMENT"] = str(ROOT / ".venv")
-    print(f"{profile}: Python {ENVIRONMENTS[profile]}, project {project.relative_to(ROOT)}, environment .venv", flush=True)
+    env.pop("VIRTUAL_ENV", None)
+    env["UV_PROJECT_ENVIRONMENT"] = str(venv)
+    print(f"{profile}: Python {ENVIRONMENTS[profile]}, environment {venv.relative_to(ROOT)}", flush=True)
     os.chdir(ROOT)
     os.execvpe(executable, [executable, "--project", str(project), *args.uv_args], env)
 

@@ -68,7 +68,7 @@ $$
 | 接口 | 导数与矩阵的处理 | 使用位置 |
 | --- | --- | --- |
 | `TDVP` | 先调用 `state.jacobian` 构造完整导数矩阵；默认求解器按矩阵形状选择样本空间或参数空间算法 | 5 个教程 |
-| `MinSR` | 对支持的顺序网络分块反向计算导数，累加 $T$；求解后再计算导数共轭转置与向量的乘积，避免一次保存整个导数矩阵 | `examples/train.py`、`examples/train_symm.py` |
+| `MinSR` | 对支持的顺序网络分块反向计算导数，累加 $T$；求解后再计算导数共轭转置与向量的乘积，避免一次保存整个导数矩阵 | [`examples/train.py`](../examples/train.py)、[`examples/train_symm.py`](../examples/train_symm.py) |
 | `TDVP_exact` | 在指定对称性基底上计算完整波函数及导数，不依赖蒙特卡洛样本 | 教程 1 |
 
 因此，教程中的 `TDVP` 在参数多于样本时也可能使用最小范数求解。`MinSR` 类进一步改变了导数的计算和保存方式。相关源码见 [tdvp.py](../quantax/optimizer/tdvp.py)、[minsr.py](../quantax/optimizer/minsr.py) 和 [solver.py](../quantax/optimizer/solver.py)。
@@ -111,7 +111,7 @@ Ising 模型含单自旋翻转项，教程使用 `LocalFlip`。Heisenberg 类模
 | [tutorials/](../tutorials/) | 5 个讲解模型和接口的 Notebook |
 | [examples/](../examples/) | 较大系统的普通训练、对称性训练和测量脚本 |
 | [params/](../params/) | 10×10 方格、$J_2/J_1=0.5$ 的 3 组已训练权重 |
-| [data/](../data/) | `Fig2a.csv`、`Fig2b.csv`、`Fig2c.csv`、`Fig3.csv` 图表数据 |
+| [data/](../data/) | [`Fig2a.csv`](../data/Fig2a.csv)、[`Fig2b.csv`](../data/Fig2b.csv)、[`Fig2c.csv`](../data/Fig2c.csv)、[`Fig3.csv`](../data/Fig3.csv) 图表数据 |
 | [images/](../images/) | 论文相关示意图和结果图 |
 
 JAX 负责自动微分、编译和设备计算，Equinox 负责网络模块和参数序列化，QuSpin 负责自旋基底、算符作用和精确对角化。仓库支持同一节点上的多设备计算；根目录说明仍将多节点兼容列为待实现内容。
@@ -121,20 +121,20 @@ JAX 负责自动微分、编译和设备计算，Equinox 负责网络模块和�
 只需修改 [run_pipeline.py](../examples/run_pipeline.py) 开头的配置区：`COMMON` 设置共用的晶格、网络、`NSAMPLES` 等参数，其中 `STEP_SIZE` 只用于两个训练阶段；`STAGES` 设置各阶段的 `STEPS` 等参数，也可在某个阶段单独覆盖 `NSAMPLES`。从仓库根目录直接运行，不用传参：
 
 ```bash
-.venv/bin/python -m examples.run_pipeline
+environments/py311-jax062/.venv/bin/python -m examples.run_pipeline
 ```
 
 流水线依次执行普通训练、对称性训练和测量，并自动传递各阶段的最终权重。已有第一阶段权重时，可设置配置区的 `FROM_CHECKPOINT` 跳过普通训练；网络设置必须与权重匹配。
 
-三个阶段脚本单独运行时，都可用命令行临时覆盖各自的配置参数，未指定的参数沿用 `run_pipeline.py` 中的默认值。例如 `.venv/bin/python -m examples.train --STEPS 1000 --NSAMPLES 2000 --step-size 0.001`。参数名支持大写下划线或小写连字符两种写法，如 `--MAX_PARALLEL` 和 `--max-parallel`；`--use-sinh` 接受 `true` 或 `false`。各脚本的参数列表见 `--help`。
+三个阶段脚本单独运行时，都可用命令行临时覆盖各自的配置参数，未指定的参数沿用 [`run_pipeline.py`](../examples/run_pipeline.py) 中的默认值。例如用对应的 JAX 解释器运行 `python -m examples.train --STEPS 1000 --NSAMPLES 2000 --step-size 0.001`。参数名支持大写下划线或小写连字符两种写法，如 `--MAX_PARALLEL` 和 `--max-parallel`。`--use-sinh` 接受 `true` 或 `false`。各脚本的参数列表见 `--help`。
 
-[train.py](../examples/train.py) 在 10×10 周期方格上用 MinSR 训练 $J_1=1$、$J_2=0.5$ 的模型。每次运行在 `runs/<体系和格点名>/<运行时间>/` 保存 `training.log`、`energy.pdf`、`VarE.pdf` 和 `params_<步数>.eqx` 等文件。体系信息已包含在目录名中，文件名不再重复。日志记录运行配置、硬件、逐步能量、方差和耗时。
+[train.py](../examples/train.py) 在 10×10 周期方格上用 MinSR 训练 $J_1=1$、$J_2=0.5$ 的模型。每次运行在 `runs/<体系和格点名>/<运行时间>/` 保存 [`training.log`](../runs/j1j2_square_10x10_J1-1_J2-0.5/20261119_030050/training.log)、[`energy.pdf`](../runs/j1j2_square_10x10_J1-1_J2-0.5/20261119_030050/energy.pdf)、[`VarE.pdf`](../runs/j1j2_square_10x10_J1-1_J2-0.5/20261119_030050/VarE.pdf) 和 [`params_2000.eqx`](../runs/j1j2_square_10x10_J1-1_J2-0.5/20261119_030050/params_2000.eqx)（2000 步示例） 等文件。体系信息已包含在目录名中，文件名不再重复。日志记录运行配置、硬件、逐步能量、方差和耗时。
 
-[train_symm.py](../examples/train_symm.py) 加入 `TotalSz() + SpinInverse() + C4v()` 约束后继续训练。脚本在独立的 `runs/<体系和格点名>/<运行时间>/` 中保存 `training_symm.log`、`energy_symm.pdf`、`VarE_symm.pdf` 和 `params_symm_<步数>.eqx` 等文件。日志开头记录运行配置和权重来源，随后以与 `train.py` 相同的格式记录能量、方差、完成步数及耗时，异常时记录堆栈。
+[train_symm.py](../examples/train_symm.py) 加入 `TotalSz() + SpinInverse() + C4v()` 约束后继续训练。脚本在独立的 `runs/<体系和格点名>/<运行时间>/` 中保存 [`training_symm.log`](../runs/j1j2_square_10x10_J1-1_J2-0.5/20261119_051106/training_symm.log)、[`energy_symm.pdf`](../runs/j1j2_square_10x10_J1-1_J2-0.5/20261119_051106/energy_symm.pdf)、[`VarE_symm.pdf`](../runs/j1j2_square_10x10_J1-1_J2-0.5/20261119_051106/VarE_symm.pdf) 和 [`params_symm_1000.eqx`](../runs/j1j2_square_10x10_J1-1_J2-0.5/20261119_051106/params_symm_1000.eqx)（1000 步示例） 等文件。日志开头记录运行配置和权重来源，随后以与 [`train.py`](../examples/train.py) 相同的格式记录能量、方差、完成步数及耗时，异常时记录堆栈。
 
-单独运行对称性训练时，用 `.venv/bin/python examples/train_symm.py --param-file <权重文件>` 指定第一阶段的 `.eqx` 文件，并确保网络设置与权重匹配。相对路径从当前工作目录解析。
+单独运行对称性训练时，用对应的 JAX 解释器运行 `python -m examples.train_symm --param-file <权重文件>`，指定第一阶段的 `.eqx` 文件，并确保网络设置与权重匹配。相对路径从当前工作目录解析。
 
-两个训练脚本每 10 步刷新能量和方差的全程图和滚动图（`_rolling.pdf`），每 100 步保存权重；最后一步也保存曲线和权重。
+两个训练脚本每 10 步刷新能量和方差的全程图和滚动图，每 100 步保存权重；最后一步也保存曲线和权重。 [滚动能量图示例](../runs/j1j2_square_10x10_J1-1_J2-0.5/20261119_030050/energy_rolling.pdf)
 
 三个阶段都为 Heisenberg 算符启用 `device_local=True`。在单设备上，局域能量所需的自旋交换、波函数求值和求和都在同一设备完成，按 `MAX_PARALLEL` 限制前向批量。通用 QuSpin 路径仍可用，未启用该选项或不满足单设备等条件时沿用原路径。数据流和对照测试见[实现改进记录](implementation-improvements.md)。
 
@@ -142,11 +142,11 @@ JAX 负责自动微分、编译和设备计算，Equinox 负责网络模块和�
 
 | `network_idx` | 网络配置 | 参数文件 |
 | --- | --- | --- |
-| 1 | 16 层、16 通道、3×3 卷积核 | `square10x10_1616.eqx` |
-| 2 | 16 层、32 通道、3×3 卷积核 | `square10x10_1632.eqx` |
-| 3 | 30 层、64 通道、3×3 卷积核 | `square10x10_3064.eqx` |
+| 1 | 16 层、16 通道、3×3 卷积核 | [`square10x10_1616.eqx`](../params/square10x10_1616.eqx) |
+| 2 | 16 层、32 通道、3×3 卷积核 | [`square10x10_1632.eqx`](../params/square10x10_1632.eqx) |
+| 3 | 30 层、64 通道、3×3 卷积核 | [`square10x10_3064.eqx`](../params/square10x10_3064.eqx) |
 
-测量脚本的注释将这些网络对应到论文图 2b 中的 ResNet2（MinSR）结果。`.eqx` 文件保存网络权重，加载时仍须创建匹配的网络结构。单独运行时若未传 `--param-file`，则读取表中自带权重；若已修改共用的晶格尺寸、卷积核或输出层设置，使用自带权重前要恢复与预设匹配的设置。`THERMAL_STEPS` 和 `SWEEP_STEPS` 分别控制初始化热化和每轮采样的更新次数，默认按实际使用的晶格尺寸取 $100L^2$ 和 $10L^2$，也可分别覆盖。每次运行创建独立的 `runs/<体系和格点名>/<运行时间>/`，`measurement.log` 开头记录运行配置和权重来源，随后记录累计平均能量、累计方差、完成步数与耗时；`measurement.csv` 逐轮保存能量、局域能量二阶矩、累计平均能量和累计方差，并立即刷新；`summary.json` 保存最终测量结果和权重来源。中断时保留已写入的 CSV，不生成最终汇总。
+测量脚本的注释将这些网络对应到论文图 2b 中的 ResNet2（MinSR）结果。`.eqx` 文件保存网络权重，加载时仍须创建匹配的网络结构。单独运行时若未传 `--param-file`，则读取表中自带权重；若已修改共用的晶格尺寸、卷积核或输出层设置，使用自带权重前要恢复与预设匹配的设置。`THERMAL_STEPS` 和 `SWEEP_STEPS` 分别控制初始化热化和每轮采样的更新次数，默认按实际使用的晶格尺寸取 $100L^2$ 和 $10L^2$，也可分别覆盖。每次运行创建独立的 `runs/<体系和格点名>/<运行时间>/`，[`measurement.log`](../runs/j1j2_square_10x10_J1-1_J2-0.5/20261119_150209/measurement.log) 开头记录运行配置和权重来源，随后记录累计平均能量、累计方差、完成步数与耗时；[`measurement.csv`](../runs/j1j2_square_10x10_J1-1_J2-0.5/20261119_150209/measurement.csv) 逐轮保存能量、局域能量二阶矩、累计平均能量和累计方差，并立即刷新；[`summary.json`](../runs/j1j2_square_10x10_J1-1_J2-0.5/20261119_150209/summary.json) 保存最终测量结果和权重来源。中断时保留已写入的 CSV，不生成最终汇总。
 
 ## 数值约定与运行限制
 
@@ -154,8 +154,8 @@ JAX 负责自动微分、编译和设备计算，Equinox 负责网络模块和�
 
 `Heisenberg` 使用 Pauli 矩阵归一化，未启用 `msr` 时每条键对应 $J_{ij}\boldsymbol{\sigma}_i\cdot\boldsymbol{\sigma}_j$。对于通常的自旋算符 $\boldsymbol S=\boldsymbol\sigma/2$，相同耦合常数下能量相差 4 倍。`msr=True` 在第一近邻键上改变横向交换项的符号，纵向项和第二近邻项保持原样。比较教程、脚本与论文表格时，需要核对这一基底约定、能量尺度以及总能量和每格点能量的区别。源码见 [common_operators.py](../quantax/operator/common_operators.py)。
 
-`optimizer.VarE` 是局域能量的中心二阶矩估计。`H.expectation(state, samples, return_var=True)` 的第二个返回值在当前实现中是 $\langle|E_{\mathrm{loc}}|^2\rangle$，尚未减去均值平方；`measure.py` 因此在汇总后另算方差。它们都不等同于能量均值的统计误差。
+`optimizer.VarE` 是局域能量的中心二阶矩估计。`H.expectation(state, samples, return_var=True)` 的第二个返回值在当前实现中是 $\langle|E_{\mathrm{loc}}|^2\rangle$，尚未减去均值平方；[`measure.py`](../examples/measure.py) 因此在汇总后另算方差。它们都不等同于能量均值的统计误差。
 
 晶格和部分对称性对象依赖全局状态并带有缓存。切换到另一教程、另一晶格尺寸或另一数值类型配置时，重启 Notebook 内核再执行。`max_parallel` 限制每台设备的前向批量，对称投影会占用该批量；它不直接限制所有导数和求解矩阵的内存。降低它可以缓解部分内存压力，样本数和网络规模也需配合调整。
 
-环境安装沿用根目录的 [安装说明](../README.md#installation)：两台运行 WSL 3.x 的 Fedora 机器分别使用 `environments/py39-jax0425/`（Python 3.9 / JAX 0.4.25）和 `environments/py311-jax062/`（Python 3.11 / JAX 0.6.2）中的配置和锁文件。运行 `python scripts/uv_machine.py sync --locked` 自动按显卡选择配置，环境统一位于根目录 `.venv/`。QuSpin wheel 需按 Python ABI 和目标系统分别构建；当前历史 QuSpin 构建不支持直接换成 Python 3.12。
+JAX 环境分别位于 `environments/py39-jax0425/.venv/` 和 `environments/py311-jax062/.venv/`。环境选择脚本可按显卡同步对应的 JAX 项目。QuSpin wheel 需按 Python ABI 和目标系统构建。[安装说明](../README.md#installation) · [uv_machine.py](../scripts/uv_machine.py)
