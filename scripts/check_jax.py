@@ -61,6 +61,23 @@ def minsr_updates():
         print(f"MinSR step {i + 1}: energy={float(optimizer.energy):.8f}", flush=True)
 
 
+def minsr_batched_derivatives():
+    import quantax as qtx
+
+    qtx.set_random_seed(42)
+    qtx.sites.Square(4)
+    hamiltonian = qtx.operator.Heisenberg(J=[1, 0.5], n_neighbor=[1, 2], msr=True, device_local=True)
+    symm = qtx.symmetry.TotalSz() + qtx.symmetry.SpinInverse() + qtx.symmetry.C4v()
+    net = qtx.nn.ResSum(8, 4, 3, use_sinh=True)
+    state = qtx.state.Variational(net, symm=symm, max_parallel=256)
+    spins = qtx.utils.rand_spins(16, state.total_sz)
+    samples = qtx.sampler.Samples(spins, state(spins), reweight=1.0)
+    reference = qtx.optimizer.MinSR(state, hamiltonian)
+    batched = qtx.optimizer.MinSR(state, hamiltonian, jacobian_batch=6)
+    np.testing.assert_allclose(batched.get_Tmat(samples), reference.get_Tmat(samples), rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(batched.get_step(samples), reference.get_step(samples), rtol=1e-4, atol=1e-5)
+
+
 def heisenberg_local_energy():
     import quantax as qtx
 
@@ -103,7 +120,11 @@ def main():
             results[name] = str(error)
             print(name, "FAIL:", type(error).__name__, str(error), flush=True)
     if not args.jax_only:
-        for name, check in [("minsr_updates", minsr_updates), ("heisenberg_local_energy", heisenberg_local_energy)]:
+        for name, check in [
+            ("minsr_updates", minsr_updates),
+            ("minsr_batched_derivatives", minsr_batched_derivatives),
+            ("heisenberg_local_energy", heisenberg_local_energy),
+        ]:
             if all(value == "PASS" for value in results.values()):
                 try:
                     check()

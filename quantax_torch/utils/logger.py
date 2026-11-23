@@ -6,6 +6,7 @@ import platform
 from datetime import datetime
 from itertools import count
 from pathlib import Path
+from time import perf_counter
 
 
 def create_run(output_dir, system_name, logger_name, log_file="training.log"):
@@ -80,6 +81,20 @@ def log_devices(logger, devices):
     logger.info(f"CPU: {_cpu_info()}")
     logger.info(f"GPU: {_gpu_inventory(devices)}")
     logger.info(f"RAM: {_ram_total()}")
+
+
+def thermalization_progress(logger, start_time):
+    """Log elapsed seconds since the last report and since the stage started."""
+    previous_time = start_time
+
+    def report(step, total):
+        nonlocal previous_time
+        end = perf_counter()
+        seconds = end - previous_time if step else 0.0
+        logger.info(f"Thermalization {step:d}/{total:d}, {seconds:.2f}, {end - start_time:.2f}")
+        previous_time = end
+
+    return report
 
 
 def log_progress(logger, energy, variance, step, total_steps, step_seconds, elapsed_seconds):

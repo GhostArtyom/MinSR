@@ -10,25 +10,27 @@ PyTorch 优化沿用原版的 Heisenberg 算符、Metropolis 采样和 MinSR 更
 
 | 设备 | 实现 | 普通训练（秒/步） | 对称性训练（秒/步） | 测量（秒/轮） | 总耗时 |
 | --- | --- | ---: | ---: | ---: | ---: |
-| RTX 4070 Ti | JAX 原版 | 1.44 | 18.47 | 49.44 | 7.5 小时 |
-| RTX 4070 Ti | PyTorch 通用版 | 1.52 | 18.44 | 37.80 | 7.1 小时 |
-| RTX 4070 Ti | PyTorch 优化版 | 0.79 | 8.07 | 13.95 | 3.1 小时 |
-| RTX 5060 Ti | JAX 原版 | 2.44 | 30.20 | 83.28 | 12.4 小时 |
-| RTX 5060 Ti | PyTorch 优化版 | 1.00 | 9.46 | 21.09 | 3.8 小时 |
+| RTX 4070 Ti | JAX | 1.44 | 18.47 | 49.44 | 7.5 小时 |
+| RTX 4070 Ti | PyTorch | 0.79 | 8.07 | 13.95 | 3.1 小时 |
+| RTX 5060 Ti | JAX | 2.44 | 30.20 | 83.28 | 12.4 小时 |
+| RTX 5060 Ti | PyTorch | 1.00 | 9.46 | 21.09 | 3.8 小时 |
 
 ## PyTorch 实现优化
 
 | 环节 | 改动 |
 | --- | --- |
-| 交换采样 | 用 CUDA Graph 重放交换提议。对称性采样跳过同向自旋交换所造成的重复波函数计算。 |
-| 局域能量 | 在设备上筛选有效交换，分批计算波函数。对称性路径用 CUDA Graph 重放批量前向并复用捕获池。 |
-| 周期卷积 | 直接按周期坐标取值，合并部分激活、残差和归约操作。 |
-| MinSR | 批量计算并缓存逐样本导数。符合条件时只计算 Gram 矩阵的一个三角，实值默认配置仍用 FP64 构造 Gram 矩阵和求解。 |
-| 绘图 | 前 100 步每 10 步画一次，此后每 100 步画一次，最后一步也出图。 |
+| [交换采样](../quantax_torch/sampler/metropolis.py) | 用 CUDA Graph 重放交换提议。对称性采样在 GPU 上筛出异向自旋的提议，跳过同向交换的波函数求值。采样链超出单图容量时分组复用图，保留原随机数生成顺序。 |
+| [局域能量](../quantax_torch/operator/common_operators.py) | 在设备上分块筛选有效交换，分批求波函数并累加。对称性路径按设备计时选择前向批量，复用整批的 CUDA Graph 和缓冲区，余下交换走即时计算。 |
+| [卷积前向](../quantax_torch/nn/_periodic_cuda.py) | 普通训练采用 `channels_last` 存储布局。专用内核用 IEEE FP32 直接按周期坐标取值，省去显式填充，并在支持的层合并激活、残差加法或末端归约。 |
+| [卷积反向](../quantax_torch/optimizer/_res_sum.py) | 对支持的 ResSum 块批量计算逐样本导数。普通训练按设备实测选择周期卷积反向或 `unfold`，对称性专用反向直接归约同一样本的轨道成员。 |
+| [MinSR 导数分批与缓存](../quantax_torch/optimizer/minsr.py) | 按可用显存估算样本批量。按显存余量缓存中心化和加权后的导数或原生 FP32 导数，求解后只重算未缓存的块。单进程 CUDA 更新遇显存分配失败时，缩减缓存或批量后用原样本重试。 |
+| [MinSR Gram 矩阵](../quantax_torch/optimizer/_cuda_gram.py) | 对符合条件的实值 FP64 矩阵，在当前设备计时比较全矩阵乘法、三角分块和 cuBLAS `SYRK`。三角路径计算一侧再补齐。 |
+| [MinSR 特征值求解](../quantax_torch/optimizer/solver.py) | 对大型 FP64 矩阵用归约检查有限值，省去同尺寸布尔掩码。可用显存偏低时，按需释放空闲的 CUDA 分配器缓存。训练可指定 cuSOLVER 或 MAGMA 后端偏好。 |
+| [绘图与存盘](../examples_torch/workflows.py) | 前 100 步每 10 步绘图，此后每 100 步绘图。每 100 步保存权重，最后一步也绘图和存盘。 |
 
-专用 CUDA 内核按设备、网络形状和运行环境启用，其余配置使用通用实现。[CUDA 开关](pytorch-migration-plan.md#cuda-开关)
+专用 CUDA 内核按网络形状和 Triton 的设备及运行环境要求启用。周期卷积反向也会在 Triton 编译失败时回退。训练日志在同一行记录导数后端、缓存和每批样本数，另列 Gram 后端。[CUDA 开关](pytorch-migration-plan.md#cuda-开关)
 
-`nsamples` 是采样链数。`max_parallel` 限制单次前向的输入数，对称性训练和测量的 CUDA 前向批量取它与 `projected_forward_batch` 的较小值，按展开后的对称轨道成员计数。
+`nsamples` 是采样链数。`max_parallel` 限制单次前向的输入数，按展开后的对称轨道成员计数。设置 `projected_forward_batch` 可在该上限内固定对称性前向批量。`jacobian_batch` 按求导的样本构型计数，中心化、Gram 矩阵和求解都使用全部样本。
 
 ## JAX：设备端局域能量
 

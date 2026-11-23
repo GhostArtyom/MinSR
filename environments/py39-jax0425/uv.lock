@@ -406,7 +406,6 @@ dependencies = [
     { name = "numexpr" },
     { name = "numpy" },
     { name = "nvidia-cudnn-cu12" },
-    { name = "quspin" },
     { name = "scipy" },
     { name = "six" },
 ]
@@ -432,7 +431,6 @@ requires-dist = [
     { name = "numexpr", specifier = "==2.8.7" },
     { name = "numpy", specifier = "==1.26.3" },
     { name = "nvidia-cudnn-cu12", specifier = ">=8.9.7.29,<9" },
-    { name = "quspin", path = "../../../QuSpin/dist/quspin-0.3.7-cp39-cp39-linux_x86_64.whl" },
     { name = "scipy", specifier = "==1.11.4" },
     { name = "six", specifier = ">=1.17.0" },
 ]
@@ -761,14 +759,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/89/91/87634934f8f7855299b8839807946d6ed7091ab928fb1c625e6b6d5cd924/pyzmq-27.3.0-cp39-cp39-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:aa8ff557c69bcf960f112f635f51b4e696b04c9e15c916aefe35fd3f08a2328f", size = 880751, upload-time = "2026-11-04T00:30:29.491Z" },
     { url = "https://files.pythonhosted.org/packages/43/69/9d36ec526d1d3816b74ab2461bbd7d289af10e4ea9e19df9bcc2908c140f/pyzmq-27.3.0-cp39-cp39-musllinux_1_2_x86_64.whl", hash = "sha256:4325e2b37026ca77872ad2e12ed836cecb838f82f7c046e88df14be0e16a89e1", size = 1914018, upload-time = "2026-11-04T00:30:41.206Z" },
     { url = "https://files.pythonhosted.org/packages/3d/56/61cb3aec415c6a15c047ce9ecbcb9944abf5afe60a051b82615dc778f2a0/pyzmq-27.3.0-pp39-pypy39_pp73-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:a75eb9dc498a6fee68a2a2156faa9396732350feda98f04ff57f9d8a43a8fba4", size = 769571, upload-time = "2026-11-04T00:31:28.263Z" },
-]
-
-[[package]]
-name = "quspin"
-version = "0.3.7"
-source = { path = "../../../QuSpin/dist/quspin-0.3.7-cp39-cp39-linux_x86_64.whl" }
-wheels = [
-    { filename = "quspin-0.3.7-cp39-cp39-linux_x86_64.whl", hash = "sha256:d6632891ee8e05cf912112ce75b7c24badbad8f0eab2f990525ae0f23be4bdf0" },
 ]
 
 [[package]]

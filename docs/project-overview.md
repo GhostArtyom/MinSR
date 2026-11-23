@@ -68,7 +68,7 @@ $$
 | 接口 | 导数与矩阵的处理 | 使用位置 |
 | --- | --- | --- |
 | `TDVP` | 先调用 `state.jacobian` 构造完整导数矩阵；默认求解器按矩阵形状选择样本空间或参数空间算法 | 5 个教程 |
-| `MinSR` | 对支持的顺序网络分块反向计算导数，累加 $T$；求解后再计算导数共轭转置与向量的乘积，避免一次保存整个导数矩阵 | [`examples/train.py`](../examples/train.py)、[`examples/train_symm.py`](../examples/train_symm.py) |
+| `MinSR` | 对支持的顺序网络按参数块反向计算导数并累加 $T$，求解后计算导数共轭转置与向量的乘积。按样本分批时，先汇合各批的导数块，再用全部样本计算中心化与 Gram 矩阵 | [`examples/train.py`](../examples/train.py)、[`examples/train_symm.py`](../examples/train_symm.py) |
 | `TDVP_exact` | 在指定对称性基底上计算完整波函数及导数，不依赖蒙特卡洛样本 | 教程 1 |
 
 因此，教程中的 `TDVP` 在参数多于样本时也可能使用最小范数求解。`MinSR` 类进一步改变了导数的计算和保存方式。相关源码见 [tdvp.py](../quantax/optimizer/tdvp.py)、[minsr.py](../quantax/optimizer/minsr.py) 和 [solver.py](../quantax/optimizer/solver.py)。
@@ -126,7 +126,15 @@ environments/py311-jax062/.venv/bin/python -m examples.run_pipeline
 
 流水线依次执行普通训练、对称性训练和测量，并自动传递各阶段的最终权重。已有第一阶段权重时，可设置配置区的 `FROM_CHECKPOINT` 跳过普通训练；网络设置必须与权重匹配。
 
+各阶段在热化开始、每完成 100 次交换提议以及热化结束时写入进度。进度后的两列分别为距上次报告的区间耗时和阶段累计耗时，单位均为秒。
+
 三个阶段脚本单独运行时，都可用命令行临时覆盖各自的配置参数，未指定的参数沿用 [`run_pipeline.py`](../examples/run_pipeline.py) 中的默认值。例如用对应的 JAX 解释器运行 `python -m examples.train --STEPS 1000 --NSAMPLES 2000 --step-size 0.001`。参数名支持大写下划线或小写连字符两种写法，如 `--MAX_PARALLEL` 和 `--max-parallel`。`--use-sinh` 接受 `true` 或 `false`。各脚本的参数列表见 `--help`。
+
+普通训练和对称性训练可用 `--jacobian-batch 1000` 从每批 1000 个样本开始计算导数。对应的流水线配置为 `JACOBIAN_BATCH=1000`，直接调用 MinSR 时使用 `jacobian_batch=1000`。默认 `None` 先整批计算导数。单进程 GPU 训练在局域能量计算完成后遇到 MinSR 显存分配错误时，用原样本重试。若失败的申请量超过分配器当前余量，就按两者的比例缩小批大小，并预留 20% 的余量。无法据此估算时将批大小减半。每次调整都会记入日志，后续训练步沿用成功的批大小。 [流水线配置](../examples/run_pipeline.py) · [MinSR 实现](../quantax/optimizer/minsr.py)
+
+减小导数批量会增加分批次数，可能增加内核调度开销并降低 GPU 利用率。JAX 切换批大小时通常要重新编译，浮点运算也可能产生小幅差异。中心化、Gram 矩阵和求解仍使用全部样本，因此样本数和估计量保持不变。
+
+选批时可用 $B\approx(M_\mathrm{budget}-M_\mathrm{margin}-M_\mathrm{fixed})/m_\mathrm{sample}$ 粗估。$M_\mathrm{fixed}$ 包括完整 Jacobian、Gram 矩阵和求解工作区，$m_\mathrm{sample}$ 可由两个批大小的导数编译显存估计之差除以批大小之差。当前 16 层、16 通道的 10000 样本配置中，FP64 Jacobian 和一份 Gram 矩阵合计约 3.35 GiB。
 
 [train.py](../examples/train.py) 在 10×10 周期方格上用 MinSR 训练 $J_1=1$、$J_2=0.5$ 的模型。每次运行在 `runs/<体系和格点名>/<运行时间>/` 保存 [`training.log`](../runs/j1j2_square_10x10_J1-1_J2-0.5/20261119_030050/training.log)、[`energy.pdf`](../runs/j1j2_square_10x10_J1-1_J2-0.5/20261119_030050/energy.pdf)、[`VarE.pdf`](../runs/j1j2_square_10x10_J1-1_J2-0.5/20261119_030050/VarE.pdf) 和 [`params_2000.eqx`](../runs/j1j2_square_10x10_J1-1_J2-0.5/20261119_030050/params_2000.eqx)（2000 步示例） 等文件。体系信息已包含在目录名中，文件名不再重复。日志记录运行配置、硬件、逐步能量、方差和耗时。
 

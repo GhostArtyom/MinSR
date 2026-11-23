@@ -8,11 +8,12 @@ MinSR is the reproduction repository for *Empowering deep neural quantum states 
 
 - Search with `rg`/`rg --files`; make manual edits with `apply_patch`, not Python replacement scripts.
 - Keep changes scoped, preserve unrelated user edits, run appropriate checks, and review the final diff.
+- Use f-strings for Python log messages that interpolate values. Use plain strings for literal messages.
 
 ### Writing and Mathematics
 
 - Keep prose paragraphs on one physical line. Leave one space after a bold label ending in punctuation.
-- In documentation, round durations under one hour to whole minutes. For durations from one hour through 24 hours, show hours to one decimal place. Above 24 hours, also show days to one decimal place in ASCII parentheses. Use seconds for per-step or per-round rates.
+- In documentation, round durations under one hour to whole minutes. For durations of at least one hour, round hours to one decimal place. Above 24 hours, also show days rounded to one decimal place in ASCII parentheses. Omit the trailing `.0` from rounded hours and days. Use seconds for per-step or per-round rates.
 - Use ASCII `/` (U+002F) for all forward slashes you write, including in Chinese prose, headings, tables, chat replies, paths, links, URLs, commands, and code. Do not use the fullwidth slash (U+FF0F). Preserve exact quotations and verbatim source text.
 - Add one space between Chinese characters and adjacent English letters or numbers, never between Chinese characters, beside Chinese punctuation, or at line boundaries. Check both boundaries of edited Markdown links using the adjacent visible characters, ignoring link markup.
 - Use `$...$` and `$$...$$` for math, not `\(...\)` or `\[...\]`. Leave standalone numbers in prose, tables, and time ranges as plain text; use math delimiters for variables and operations.
@@ -29,6 +30,7 @@ MinSR is the reproduction repository for *Empowering deep neural quantum states 
 ## Run directories and Git
 
 - JAX writes to `runs/<system>/<timestamp>/` by default, and PyTorch writes to `runs/torch/<system>/<timestamp>/`. Use `runs/<system>/<timestamp>/` for shared archives. Put any pipeline console log and PID file in the first stage's run directory. Use separate temporary directories only for debugging or smoke tests.
+- When starting a run that writes logs, tell the user the log location as soon as it is available. For pipelines, share the console log and report each stage's log when it starts.
 - Keep `runs/` ignored by default. When asked to commit results from completed runs, force-add the final checkpoint from each selected training stage in its native format (`.eqx` for JAX, `.pt` for PyTorch), the stage log, and the PDF plots. For completed measurements, include `measurement.log`, `measurement.csv`, `summary.json`, and any PDFs. The input checkpoint belongs in its training archive.
 - Leave launcher logs, PID files, intermediate checkpoints, other CSV/JSON outputs, and smoke or benchmark runs untracked. Add files by explicit path, not the entire run directory.
 

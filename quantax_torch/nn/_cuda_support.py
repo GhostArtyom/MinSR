@@ -20,10 +20,10 @@ def triton_runtime_issue():
     return None if compiler else "C compiler is unavailable"
 
 
-def supports_tuned_kernels(device):
-    return cuda_capability(device) == (12, 0) and triton_runtime_issue() is None
-
-
-def validated_ada_res_sum(network, lattice_shape, nsamples, max_parallel, *, channels=(16,)):
-    return (tuple(lattice_shape) == (10, 10, 1) and nsamples == 1000 and max_parallel == 32768
-            and any(network == dict(depth=16, channels=width, kernel_size=3, use_sinh=True) for width in channels))
+def periodic_cuda_issue(device):
+    capability = cuda_capability(device)
+    if capability is None:
+        return "requires NVIDIA CUDA"
+    if capability < (8, 0):
+        return "Triton CUDA requires compute capability 8.0 or later"
+    return triton_runtime_issue()

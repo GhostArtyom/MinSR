@@ -26,9 +26,11 @@ COMMON = {
 STAGES = {
     "train": {
         "STEPS": 2000,  # 20000
+        "JACOBIAN_BATCH": None,
     },
     "train_symm": {
         "STEPS": 1000,  # 10000
+        "JACOBIAN_BATCH": None,  # 250 limits derivative memory for 10000 samples.
     },
     "measure": {"STEPS": 100},
 }
@@ -56,7 +58,7 @@ def _parse_bool(value):
 
 def add_config_arguments(parser, stage):
     """Expose existing configuration keys as optional standalone arguments."""
-    types = {"J1": float, "J2": float, "STEP_SIZE": float, "USE_SINH": _parse_bool}
+    types = {"J1": float, "J2": float, "STEP_SIZE": float, "USE_SINH": _parse_bool, "JACOBIAN_BATCH": int}
     for key, value in get_stage_config(stage).items():
         name = key.lower().replace("_", "-")
         help_text = f"Default: {value}"

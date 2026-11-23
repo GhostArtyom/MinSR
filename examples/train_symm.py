@@ -23,10 +23,11 @@ from quantax.symmetry import TotalSz, SpinInverse, C4v
 from quantax.utils import (
     create_run, close_run, log_devices, log_progress, setup_plot_font, save_training_plots,
 )
+from quantax.utils.logger import thermalization_progress
 
 def _train(
     param_file, *, L, J1, J2, DEPTH, CHANNELS, KERNEL_SIZE, USE_SINH,
-    NSAMPLES, STEPS, STEP_SIZE, MAX_PARALLEL, OUTPUT_DIR,
+    NSAMPLES, STEPS, STEP_SIZE, MAX_PARALLEL, JACOBIAN_BATCH, OUTPUT_DIR,
 ):
     if param_file is None:
         raise ValueError("Choose input weights with --param-file PATH.")
@@ -43,6 +44,8 @@ def _train(
         logger.info(f"Input weights: {param_file}")
         logger.info(f"System: {system_name}; periodic boundaries; total Sz=0")
         logger.info(f"Steps={STEPS}; samples={NSAMPLES}; max_parallel={MAX_PARALLEL}; step_size={STEP_SIZE}; reweight=1.0")
+        if JACOBIAN_BATCH is not None:
+            logger.info(f"MinSR derivative sample batch={JACOBIAN_BATCH:d}")
         logger.info(f"Network: ResSum(depth={DEPTH}, channels={CHANNELS}, kernel_size={KERNEL_SIZE}, use_sinh={USE_SINH})")
         logger.info(f"Symmetry: TotalSz(0) + SpinInverse() + C4v()")
         if STEPS < 1 or NSAMPLES < 1 or MAX_PARALLEL < 16:
@@ -55,9 +58,12 @@ def _train(
         state = qtx.state.Variational(
             net, param_file=param_file, symm=TotalSz() + SpinInverse() + C4v(), max_parallel=MAX_PARALLEL,
         )
+        optimizer = qtx.optimizer.MinSR(state, H, jacobian_batch=JACOBIAN_BATCH, logger=logger)
         # Reweighted sampling for more efficient training (only for N <= 100).
-        sampler = qtx.sampler.NeighborExchange(state, NSAMPLES, reweight=1.0, n_neighbor=[1, 2])
-        optimizer = qtx.optimizer.MinSR(state, H)
+        sampler = qtx.sampler.NeighborExchange(
+            state, NSAMPLES, reweight=1.0, n_neighbor=[1, 2],
+            thermal_progress=thermalization_progress(logger, start_time),
+        )
         jax.block_until_ready(sampler.current_wf)
         energy = qtx.utils.DataTracer()
         VarE = qtx.utils.DataTracer()

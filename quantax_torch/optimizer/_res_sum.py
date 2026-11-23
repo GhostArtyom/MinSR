@@ -6,7 +6,7 @@ import torch
 from torch.nn import functional as F
 
 from ..nn import Conv, Sequential
-from ..nn._cuda_support import supports_tuned_kernels
+from ..nn._cuda_support import periodic_cuda_issue
 from ..nn.modules import _circular_pad
 from ..nn.sum_nets import ResBlock
 
@@ -82,7 +82,33 @@ def _reverse(block, x, delta, propagate, weight_grad, orbit):
     return torch.cat([g for layer_grads in reversed(gradients) for g in layer_grads], dim=1), delta
 
 
-def batched_res_sum_vjp(block, x, delta, propagate, max_parallel, *, ada_weight_grad=False):
+def _reverse_batches(block, x, delta, propagate, batch, weight_grad):
+    orbit = x.shape[1]
+    grads, upstream = [], []
+    for features, cotangent in zip(x.split(batch), delta.split(batch), strict=True):
+        grad, d_input = _reverse(block, features.flatten(0, 1), cotangent.flatten(0, 1),
+                                 propagate, weight_grad, orbit)
+        grads.append(grad)
+        if propagate:
+            upstream.append(d_input.unflatten(0, features.shape[:2]))
+    return torch.cat(grads), torch.cat(upstream) if propagate else None, weight_grad is not None
+
+
+def _prefer_periodic(block, x, delta, propagate, weight_grad):
+    timings = []
+    start, stop = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+    for backend in (None, weight_grad):
+        _reverse(block, x, delta, propagate, backend, 1)
+        start.record()
+        for _ in range(2):
+            _reverse(block, x, delta, propagate, backend, 1)
+        stop.record()
+        stop.synchronize()
+        timings.append(start.elapsed_time(stop))
+    return timings[1] < 0.95 * timings[0]
+
+
+def batched_res_sum_vjp(block, x, delta, propagate, max_parallel, backend_choices):
     if (
         x.device.type != "cuda" or x.ndim != 5 or not 1 <= x.shape[1] <= 16 or x.dtype != torch.float32
         or type(block) is not Sequential or not len(block) or not _unhooked(block)
@@ -96,17 +122,9 @@ def batched_res_sum_vjp(block, x, delta, propagate, max_parallel, *, ada_weight_
     orbit = x.shape[1]
     sites = x.shape[-2] * x.shape[-1]
     convolutions = [conv for layer in block for conv in (layer.conv1, layer.conv2)]
-    weight_grad = None
-    if (sites <= 100 and delta.dtype == x.dtype and not torch.is_autocast_enabled("cuda")
-            and all(max(conv.kernel_size) <= 5 and conv.weight.shape[0] <= 64 for conv in convolutions)
-            and (ada_weight_grad or supports_tuned_kernels(x.device))):
-        from ._res_sum_cuda import periodic_weight_grad
-
-        weight_grad = periodic_weight_grad
-    elif orbit > 1:
-        # A projected sample needs a sum across all orbit members, not one
-        # parameter-gradient row per convolution input.
-        return None
+    periodic = (sites <= 100 and delta.dtype == x.dtype and not torch.is_autocast_enabled("cuda")
+                and all(max(conv.kernel_size) <= 5 and conv.weight.shape[0] <= 64 for conv in convolutions)
+                and periodic_cuda_issue(x.device) is None)
     if orbit == 1:
         # Retain the previous chunk size, including for the unfold fallback.
         batch = max(1, 2**24 // (sites * max(conv.weight[0].numel() for conv in convolutions)))
@@ -120,11 +138,27 @@ def batched_res_sum_vjp(block, x, delta, propagate, max_parallel, *, ada_weight_
             # chunks. This does not change the inference or forward cap.
             batch = min(batch, max(1, 512 // orbit))
     batch = min(batch, len(x) if max_parallel is None else max(1, max_parallel // orbit))
-    grads, upstream = [], []
-    for features, cotangent in zip(x.split(batch), delta.split(batch), strict=True):
-        grad, d_input = _reverse(block, features.flatten(0, 1), cotangent.flatten(0, 1),
-                                 propagate, weight_grad, orbit)
-        grads.append(grad)
-        if propagate:
-            upstream.append(d_input.unflatten(0, features.shape[:2]))
-    return torch.cat(grads), torch.cat(upstream) if propagate else None, weight_grad is not None
+    if periodic:
+        from triton.errors import TritonError
+
+        from ._res_sum_cuda import periodic_weight_grad
+
+        key = (block, x.device, x.shape[1:], x.stride(), delta.stride(), batch, propagate)
+        try:
+            with torch.cuda.device(x.device):
+                choice = backend_choices.get(key)
+                if choice is None and orbit == 1:
+                    if torch.are_deterministic_algorithms_enabled() or torch.cuda.is_current_stream_capturing():
+                        choice = False
+                    else:
+                        choice = _prefer_periodic(block, x[:batch, 0], delta[:batch, 0], propagate,
+                                                  periodic_weight_grad)
+                        backend_choices[key] = choice
+                if choice is not False:
+                    return _reverse_batches(block, x, delta, propagate, batch, periodic_weight_grad)
+        except TritonError:
+            backend_choices[key] = False
+    # Only the periodic reverse pass reduces orbit members to one row per sample.
+    if orbit == 1:
+        return _reverse_batches(block, x, delta, propagate, batch, None)
+    return None

@@ -21,7 +21,6 @@ dependencies = [
     "numexpr==2.8.7",
     "numpy==1.26.3",
     "nvidia-cudnn-cu12>=8.9.7.29,<9",
-    "quspin",
     "scipy==1.11.4",
     "six>=1.17.0",
 ]
@@ -36,9 +35,6 @@ include = ["quantax*"]
 [[tool.uv.index]]
 url = "https://pypi.org/simple"
 default = true
-
-[tool.uv.sources]
-quspin = { path = "../../../QuSpin/dist/quspin-0.3.7-cp39-cp39-linux_x86_64.whl" }
 
 [tool.uv]
 find-links = ["https://storage.googleapis.com/jax-releases/jax_cuda_releases.html"]

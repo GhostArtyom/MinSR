@@ -1,3 +1,4 @@
+import sys
 from numbers import Number
 
 import torch
@@ -6,58 +7,138 @@ from .operator import Operator
 from ..global_defs import get_sites
 from ..sampler import Samples
 from ..state import Variational
+from ..symmetry import Symmetry
 
 
-def _replay_exchange(accumulate, rows, terms, chunk, result, maximum, *, workspaces=None):
-    """Replay four full inference batches at once for this local-energy call."""
-    batches = 4
-    count = batches * chunk
-    src = rows[:count].clone().view(batches, chunk)
-    term = terms[:count].clone().view_as(src)
-    device = rows.device
-    with torch.cuda.device(device):
-        current = torch.cuda.current_stream(device)
-        previous = None if workspaces is None else workspaces.get(current)
-        stream = torch.cuda.Stream(device=device) if previous is None else previous[0]
-        pool = None if previous is None else previous[1].pool()
+_MAX_EXCHANGE_MASK_ELEMENTS = 2**22
+
+
+def _tune_exchange_batch(state, accumulate, configs, rows, terms, result, base):
+    orbit = state.nsymm
+    limit = min(4096, state.max_parallel or 4096) // orbit
+    candidates = [batch for batch in (base, 2 * base, 4 * base) if batch <= limit and len(rows) >= 32 * batch]
+    if len(candidates) < 2:
+        return base
+    width = state.ansatz[0].config["channels"]
+    free, _ = torch.cuda.mem_get_info(configs.device)
+    # Keep tuning allocations small relative to the free device memory.
+    candidates = [batch for batch in candidates
+                  if batch == base or 32 * batch * orbit * state.nsites * width <= free // 4]
+    if len(candidates) < 2:
+        return base
+    # Benchmark replay, which has a different launch profile from eager forward.
+    multiple = 4 * max(candidates)
+    count = min(len(rows), 256 * base) // multiple * multiple
+    rows, terms = rows[:count], terms[:count]
+    current = torch.cuda.current_stream(configs.device)
+    saved_maximum = state._maximum.clone()
+    scratch = torch.zeros_like(result)
+    start, stop = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+    rates = {}
+    try:
+        for batch in candidates:
+            scratch.zero_()
+            probe = _LocalEnergyGraph(accumulate, configs, scratch, rows, terms, batch, state._maximum,
+                                      current, None)
+            start.record()
+            probe.replay(configs, scratch, rows, terms)
+            stop.record()
+            stop.synchronize()
+            rates[batch] = start.elapsed_time(stop)
+            del probe
+    finally:
+        state._maximum.copy_(saved_maximum)
+    best = min(rates, key=rates.get)
+    return base if rates[best] > 0.98 * rates[base] else best
+
+
+def _periodic_graph_net(state):
+    periodic = sys.modules.get("quantax_torch.nn._periodic_cuda")
+    hooks = torch.nn.modules.module
+    if (periodic is not None and state.inference_fn is periodic.res_sum_forward
+            and type(state.symm) is Symmetry and len(state.ansatz) == 1
+            and not torch.is_autocast_enabled("cuda")
+            and not (hooks._global_forward_hooks or hooks._global_forward_pre_hooks)
+            and periodic.supports_counted_res_sum(state.ansatz[0])):
+        return state.ansatz[0]
+    return None
+
+
+class _LocalEnergyGraph:
+    def __init__(self, accumulate, configs, result, rows, terms, chunk, maximum, current, previous):
+        self.configs = configs.clone()
+        self.result = torch.zeros_like(result)
+        self.src = rows[:4 * chunk].clone().view(4, chunk)
+        self.term = terms[:4 * chunk].clone().view_as(self.src)
+        indices = torch.arange(chunk, device=rows.device)
+        self.indices = indices
+        self.stream = torch.cuda.Stream(device=rows.device) if previous is None else previous.stream
+        pool = None if previous is None else previous.graph.pool()
         saved_maximum = maximum.clone()
-        scratch = torch.zeros_like(result)
-        stream.wait_stream(current)
-        with torch.cuda.stream(stream):
-            # Warm up library kernels without including an extra batch in
-            # either the estimator or the wave function scale estimate.
-            accumulate(scratch, src[0], term[0])
+        self.stream.wait_stream(current)
+        with torch.cuda.stream(self.stream):
+            # Warm up without including an extra batch in the estimator or scale.
+            accumulate(self.configs, self.result, self.src[0], self.term[0], indices)
             maximum.copy_(saved_maximum)
-        current.wait_stream(stream)
-        graph = torch.cuda.CUDAGraph()
-        # The convenience context synchronizes the device and empties the
-        # allocator cache. That penalizes the MinSR allocations after Oloc
-        # when a new graph is captured on every step.
-        with torch.cuda.stream(stream):
-            graph.capture_begin(pool=pool)
+        current.wait_stream(self.stream)
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(self.stream):
+            self.graph.capture_begin(pool=pool)
             try:
-                for source, bond in zip(src.unbind(), term.unbind(), strict=True):
-                    accumulate(result, source, bond)
+                for source, bond in zip(self.src.unbind(), self.term.unbind(), strict=True):
+                    accumulate(self.configs, self.result, source, bond, indices)
             finally:
-                graph.capture_end()
+                self.graph.capture_end()
+
+    def replay(self, configs, result, rows, terms):
+        active = len(configs)
+        self.configs[:active].copy_(configs)
+        self.result[:active].copy_(result)
+        count = self.src.numel()
         end = rows.numel() // count * count
-        for i in range(0, end, count):
-            src.copy_(rows[i:i + count].view_as(src))
-            term.copy_(terms[i:i + count].view_as(term))
-            graph.replay()
-        # Keep the pool alive until the next capture on this caller stream.
-        # Replays are ordered and result was allocated outside the pool.
+        for offset in range(0, end, count):
+            self.src.view(-1).copy_(rows[offset:offset + count])
+            self.term.view(-1).copy_(terms[offset:offset + count])
+            self.graph.replay()
+        result.copy_(self.result[:active])
+        return end
+
+
+def _replay_exchange(accumulate, configs, rows, terms, chunk, result, state, bonds, *, workspaces=None, net=None):
+    with torch.cuda.device(rows.device):
+        current = torch.cuda.current_stream(rows.device)
+        key = None
+        previous = None
         if workspaces is not None:
-            workspaces[current] = stream, graph
-    return end
+            previous = workspaces.get(current)
+            if net is not None:
+                tensors = (state._maximum, *bonds, *state.symm._on_device(rows.device),
+                           *net.parameters(), *net.buffers())
+                key = (configs.shape[1:], configs.dtype, result.dtype, chunk, id(state), id(state.symm),
+                       id(state.input_fn), id(state.output_fn), state.forward_batch, id(net),
+                       torch.is_inference_mode_enabled(),
+                       tuple((t.data_ptr(), t.shape, t.stride(), t.dtype) for t in tensors))
+        if (previous is not None and key is not None and previous[0] == key
+                and len(previous[1].configs) >= len(configs)):
+            workspace = previous[1]
+        else:
+            workspace = _LocalEnergyGraph(accumulate, configs, result, rows, terms, chunk, state._maximum,
+                                          current, None if previous is None else previous[1])
+            if workspaces is not None:
+                workspace.tensors = tensors if key is not None else ()
+                workspaces[current] = key, workspace
+        return workspace.replay(configs, result, rows, terms)
 
 
 class _Heisenberg(Operator):
-    def __init__(self, terms, *, local_energy_graph, reuse_local_energy_pool=False):
+    def __init__(self, terms, *, local_energy_graph, reuse_local_energy_pool=False, tune_local_energy=False):
         super().__init__(terms)
         self.local_energy_graph = local_energy_graph
         self._local_energy_graph_used = False
         self._local_energy_workspaces = {} if reuse_local_energy_pool else None
+        self._tune_local_energy = tune_local_energy
+        self._local_energy_batch = None
+        self._batch_key = None
 
     @torch.no_grad()
     def psiOloc(self, state, samples):
@@ -70,20 +151,13 @@ class _Heisenberg(Operator):
         psi = samples.wave_function
 
         # Both exchange strings connect the same configurations; exactly one
-        # is nonzero on each antiparallel bond. Compact the full mask once.
+        # is nonzero on each antiparallel bond.
         groups = {name: (coeff, idx) for name, coeff, idx in self._groups(spins.device)}
         if "+-" not in groups:
             return super().psiOloc(state, samples)
         coupling, bonds = groups["zz"]
-        if len(spins) * len(bonds) > 2**22:
-            # Do not turn an arbitrarily large local estimator into a single
-            # dense sample-by-bond allocation.
-            return super().psiOloc(state, samples)
         exchange, _ = groups["+-"]
         left, right = bonds.unbind(dim=1)
-        a, b = spins[:, left], spins[:, right]
-        result = ((a * b * coupling).sum(dim=1) * psi)
-        rows, terms = torch.nonzero((a != b) & (exchange != 0), as_tuple=True)
         max_parallel = getattr(state, "max_parallel", None)
         forward_batch = getattr(state, "forward_batch", max_parallel)
         chunk = 32768 if forward_batch is None else forward_batch // state.nsymm
@@ -91,34 +165,72 @@ class _Heisenberg(Operator):
             # A smaller convolution batch keeps the padded feature maps
             # smaller; max_parallel is a ceiling, not a required batch size.
             chunk = min(chunk, 2048)
-        start_indices = torch.arange(min(chunk, rows.numel()), device=spins.device)
 
-        def accumulate(out, src, term):
-            connected = spins[src]
-            idx = start_indices[:src.numel()]
-            connected[idx, left[term]] *= -1
-            connected[idx, right[term]] *= -1
-            contribution = state(connected) * exchange[term]
-            out.index_add_(0, src, contribution.to(out.dtype))
+        # Compact exchanges in sample blocks so a large sample count can still
+        # use replay while the temporary sample-by-bond arrays stay bounded.
+        sample_batch = max(1, _MAX_EXCHANGE_MASK_ELEMENTS // len(bonds))
+        result = torch.empty_like(psi, dtype=torch.promote_types(psi.dtype, coupling.dtype))
+        replay = (self.local_energy_graph and spins.is_cuda and type(state) is Variational
+                  and state.nsymm > 1 and state.inference_fn is not None
+                  and state._default_input and state._default_output
+                  and not torch.are_deterministic_algorithms_enabled())
+        net = _periodic_graph_net(state) if replay else None
+        tune = self._tune_local_energy and net is not None and getattr(net, "config", None) is not None
+        if tune:
+            key = (spins.device, id(net), state.nsymm, forward_batch, max_parallel)
+            if self._batch_key != key:
+                self._local_energy_batch = None
+                self._batch_key = key
+            base = chunk
+        has_exchange = False
+        for configs, wf, out in zip(spins.split(sample_batch), psi.split(sample_batch),
+                                    result.split(sample_batch), strict=True):
+            a, b = configs[:, left], configs[:, right]
+            out.copy_((a * b * coupling).sum(dim=1) * wf)
+            rows, terms = torch.nonzero((a != b) & (exchange != 0), as_tuple=True)
+            if not rows.numel():
+                continue
+            has_exchange = True
 
-        start = 0
-        if (self.local_energy_graph and spins.is_cuda and type(state) is Variational
-                and state.nsymm > 1 and state.inference_fn is not None
-                and state._default_input and state._default_output
-                and rows.numel() >= 32 * chunk and not torch.are_deterministic_algorithms_enabled()):
-            start = _replay_exchange(accumulate, rows, terms, chunk, result, state._maximum,
-                                     workspaces=self._local_energy_workspaces)
-            self._local_energy_graph_used = start > 0
-        for src, term in zip(rows[start:].split(chunk), terms[start:].split(chunk), strict=True):
-            if src.numel():
-                accumulate(result, src, term)
-        if rows.numel() and max_parallel is not None:
+            def accumulate(configs, out, src, term, indices):
+                connected = configs[src]
+                idx = indices[:src.numel()]
+                connected[idx, left[term]] *= -1
+                connected[idx, right[term]] *= -1
+                if tune:
+                    psi_connected = state._inference(connected)
+                    state._record_maximum(psi_connected)
+                else:
+                    psi_connected = state(connected)
+                contribution = psi_connected * exchange[term]
+                out.index_add_(0, src, contribution.to(out.dtype))
+
+            if tune:
+                if self._local_energy_batch is None and rows.numel() >= 64 * base:
+                    try:
+                        with torch.cuda.device(spins.device):
+                            self._local_energy_batch = _tune_exchange_batch(
+                                state, accumulate, configs, rows, terms, out, base
+                            )
+                    except torch.cuda.OutOfMemoryError:
+                        self._local_energy_batch = base
+                chunk = self._local_energy_batch or base
+            start_indices = torch.arange(min(chunk, rows.numel()), device=spins.device)
+            start = 0
+            if replay and rows.numel() >= 32 * chunk:
+                start = _replay_exchange(accumulate, configs, rows, terms, chunk, out, state, (bonds, exchange),
+                                         workspaces=self._local_energy_workspaces, net=net)
+                self._local_energy_graph_used = True
+            for offset in range(start, rows.numel(), chunk):
+                accumulate(configs, out, rows[offset:offset + chunk], terms[offset:offset + chunk], start_indices)
+        if has_exchange and max_parallel is not None:
             # Keep the scale estimate's all-up padding from the generic path.
             state(torch.ones_like(spins[:1]))
         return result
 
 
-def Heisenberg(J=1.0, n_neighbor=1, msr=False, *, local_energy_graph=False, reuse_local_energy_pool=False):
+def Heisenberg(J=1.0, n_neighbor=1, msr=False, *, local_energy_graph=False, reuse_local_energy_pool=False,
+               tune_local_energy=False):
     """Build a Heisenberg operator; graph replay requires a capture-safe inference backend."""
     J = [J] if isinstance(J, Number) else J
     shells = [n_neighbor] if isinstance(n_neighbor, int) else n_neighbor
@@ -133,7 +245,8 @@ def Heisenberg(J=1.0, n_neighbor=1, msr=False, *, local_energy_graph=False, reus
         exchange.extend([2 * sign * coupling, i, j] for i, j in bonds)
     terms = [["zz", diag], ["+-", exchange], ["-+", exchange]]
     if all(i != j for _, i, j in diag):
-        return _Heisenberg(terms, local_energy_graph=local_energy_graph, reuse_local_energy_pool=reuse_local_energy_pool)
+        return _Heisenberg(terms, local_energy_graph=local_energy_graph, reuse_local_energy_pool=reuse_local_energy_pool,
+                           tune_local_energy=tune_local_energy)
     return Operator(terms)
 
 

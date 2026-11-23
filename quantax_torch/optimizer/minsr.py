@@ -1,42 +1,52 @@
+import logging
 import math
+import re
 from itertools import islice
+from operator import index
 
 import torch
 from torch import distributed
 from torch.func import functional_call, vjp, vmap
 
-from ._cuda_gram import add_gram_lower_
+from ._cuda_gram import add_gram_lower_, add_gram_tiled_, mirror_gram_, tune_gram
 from ._res_sum import batched_res_sum_vjp
 from .solver import minsr_pinv_eig
 from .tdvp import TDVP, _stack_components
 from ..nn import Sequential
-from ..nn._cuda_support import cuda_capability, supports_tuned_kernels, triton_runtime_issue, validated_ada_res_sum
 from ..sampler import Samples
 
 
 _DERIVATIVE_CACHE_BYTES = 320 * 2**20
 
 
-def _gram_tile(T):
-    # On the tested consumer CUDA architecture, FP64 GEMM is expensive
-    # enough to benefit from not computing both halves of a large Gram.
-    n = T.shape[0]
-    if 512 <= n <= 4096 and T.dtype == torch.float64 and cuda_capability(T.device) == (12, 0):
-        return 128 if n <= 1024 else 256
-    return 0
+def _cuda_memory(device):
+    """Return allocator headroom and physical capacity in bytes."""
+    free, total = torch.cuda.mem_get_info(device)
+    with torch.cuda.device(device):
+        device_index = torch.cuda.current_device()
+        limit = int(total * torch.cuda.get_per_process_memory_fraction(device_index))
+    stats = torch.cuda.memory_stats(device)
+    allocated = stats.get("allocated_bytes.all.current", 0)
+    reserved = stats.get("reserved_bytes.all.current", 0)
+    fragmented = stats.get("inactive_split_bytes.all.current", 0)
+    reusable = max(0, reserved - allocated - fragmented)
+    return max(0, min(free + reusable, limit - allocated - fragmented)), total
 
 
-def _ada_ordinary_res_sum(state, nsamples, channels):
-    return (cuda_capability(state.device) == (8, 9) and state.dtype == torch.float64
-            and state.nsymm == 1 and len(state.ansatz) == 1 and not torch.is_autocast_enabled("cuda")
-            and validated_ada_res_sum(getattr(state.ansatz[0], "config", None),
-                                     getattr(state.symm.sites, "shape", ()), nsamples, state.max_parallel,
-                                     channels=channels)
-            and all(p.dtype == torch.float32 for p in state.parameters()))
-
-
-def _ada_gram_syrk(state, T):
-    return T.dtype == torch.float64 and _ada_ordinary_res_sum(state, T.shape[0], (16,))
+def _retry_batch(batch_size, message, device):
+    request = re.search(r"allocate (\d+(?:\.\d+)?) (bytes|[KMGT]iB)\b", message)
+    if request is not None:
+        unit = ("bytes", "KiB", "MiB", "GiB", "TiB").index(request[2])
+        requested = float(request[1]) * 1024**unit
+        try:
+            available, _ = _cuda_memory(device)
+        except RuntimeError:
+            return batch_size // 2
+        if 0 < available < requested:
+            # Estimate how many samples fit with 20% headroom. The
+            # failed allocation may also include fixed-size buffers.
+            return max(1, int(0.8 * batch_size * available / requested))
+    return batch_size // 2
 
 
 def _active_params(module):
@@ -70,22 +80,63 @@ def _on_orbits(module, x, params=None):
 
 
 class MinSR(TDVP):
-    """Compute the sample Gram matrix and step over parameter blocks."""
+    """Compute the sample Gram matrix and step over parameter blocks.
 
-    def __init__(self, state, hamiltonian, solver=None, *, jacobian_batch=8, process_group=None):
+    ``jacobian_batch`` bounds the number of sampled configurations in a
+    derivative batch. When omitted, CUDA chooses it from allocator headroom
+    and estimated temporary storage. Gram and solve use all samples.
+    """
+
+    def __init__(self, state, hamiltonian, solver=None, *, jacobian_batch=None, process_group=None, logger=None):
         super().__init__(state, hamiltonian, solver=minsr_pinv_eig() if solver is None else solver)
         if self.vs_type == 1:
             raise ValueError("MinSR does not support non-holomorphic complex parameters.")
-        if jacobian_batch < 1:
-            raise ValueError("jacobian_batch must be positive.")
+        if jacobian_batch is not None:
+            jacobian_batch = index(jacobian_batch)
+            if jacobian_batch < 1:
+                raise ValueError("jacobian_batch must be positive.")
         self.jacobian_batch = jacobian_batch
+        self._logger = logger if logger is not None else logging.getLogger(__name__)
         self.process_group = process_group
         self._layers = tuple(_block_layers(net) for net in state.ansatz)
         self._complex_params = any(p.is_complex() for p in state.parameters())
         self._vjp_backends = set()
+        self._vjp_backend_choices = {}
         self._gram_backends = set()
-        self._ada_gram_requested = False
+        self._gram_backend_choices = {}
         self._last_cache_plan = (None, None)
+        self._cache_limit = None
+        self._jacobian_batch_limit = None
+        self._last_jacobian_batch = None
+
+    def _derivative_batch(self, spins):
+        cap = min(len(spins), self._jacobian_batch_limit or len(spins))
+        if self.jacobian_batch is not None:
+            return min(cap, self.jacobian_batch)
+        if not spins.is_cuda:
+            return cap
+        try:
+            available, total = _cuda_memory(spins.device)
+        except RuntimeError:
+            return 1
+        params = tuple(self.state.parameters())
+        dtype_bytes = max((param.element_size() for param in params), default=spins.element_size())
+        total_params = sum(param.numel() for param in params)
+        blocks = [block for _, layers, _ in self._layers for block in layers]
+        widest_block = max((sum(p.numel() for p in block.parameters() if p.requires_grad) for block in blocks),
+                           default=total_params)
+        channels = max((p.shape[0] for p in params if p.ndim >= 3), default=1)
+        orbit = self.state.nsymm
+        feature_bytes = orbit * self.state.nsites * channels * dtype_bytes
+        # Saved block boundaries, cotangents, concatenation and live convolution tensors.
+        per_sample = max(1, 2 * (len(blocks) + 4) * feature_bytes + widest_block * dtype_bytes)
+        scalar_bytes = self.state.dtype.itemsize
+        # The Gram is allocated by get_Tmat before we get here. Reserve derivative
+        # outputs and FP64 centering temporaries that can coexist with activations.
+        fixed = len(spins) * (total_params * max(dtype_bytes, scalar_bytes)
+                              + 2 * widest_block * scalar_bytes)
+        headroom = max(0, available - fixed - total // 10)
+        return max(1, min(cap, headroom // (3 * per_sample)))
 
     @torch.no_grad()
     def _prepare(self, spins):
@@ -135,19 +186,19 @@ class MinSR(TDVP):
                 return real, imag
             return real, ()
 
-        real, imag = vmap(cotangents, chunk_size=self.jacobian_batch)(*endpoints)
+        real, imag = vmap(cotangents)(*endpoints)
         return positions, real, imag
 
     @torch.no_grad()
-    def _block_vjp(self, block, x, delta_real, delta_imag, propagate, *, ada_weight_grad=False):
+    def _block_vjp(self, block, x, delta_real, delta_imag, propagate):
         if delta_imag is None and not self._complex_params:
             result = batched_res_sum_vjp(block, x, delta_real, propagate, self.state.max_parallel,
-                                         ada_weight_grad=ada_weight_grad)
+                                         self._vjp_backend_choices)
             if result is not None:
                 jac, upstream, periodic = result
-                self._vjp_backends.add("periodic weight gradient" if periodic else "batched unfold")
+                self._vjp_backends.add("periodic" if periodic else "unfold")
                 return jac, upstream, None
-        self._vjp_backends.add("generic autograd")
+        self._vjp_backends.add("autograd")
         params = _active_params(block)
 
         def backward_one(x, real, imag=None):
@@ -166,17 +217,14 @@ class MinSR(TDVP):
             upstream_imag = back_imag[1] if propagate else torch.empty(0, device=x.device)
             return torch.complex(grad_real, grad_imag), upstream_real, upstream_imag
 
-        batched = vmap(backward_one, chunk_size=self.jacobian_batch)
+        batched = vmap(backward_one)
         if delta_imag is None:
             jac, real = batched(x, delta_real)
             return jac, real, None
         jac, real, imag = batched(x, delta_real, delta_imag)
         return jac, real, imag
 
-    def _native_jacobian_blocks(self, spins):
-        spins = torch.as_tensor(spins, device=self.state.device)
-        ada_weight_grad = (self.process_group is None and _ada_ordinary_res_sum(self.state, len(spins), (32,))
-                           and triton_runtime_issue() is None)
+    def _differentiate(self, spins, first_block=0):
         positions, real, imag = self._prepare(spins)
         block_index = sum(len(blocks) for _, blocks, _ in self._layers)
         for i in reversed(range(len(self._layers))):
@@ -185,9 +233,32 @@ class MinSR(TDVP):
             im = imag[i] if imag else None
             for j in reversed(range(len(blocks))):
                 block_index -= 1
-                jac, r, im = self._block_vjp(blocks[j], positions[i][j], r, im, propagate=j > 0,
-                                             ada_weight_grad=ada_weight_grad)
+                if block_index < first_block:
+                    return
+                jac, r, im = self._block_vjp(blocks[j], positions[i][j], r, im,
+                                             propagate=j > 0 and block_index > first_block)
                 yield block_index, jac
+
+    def _native_jacobian_blocks(self, spins, first_block=0):
+        spins = torch.as_tensor(spins, device=self.state.device)
+        nsamples = len(spins)
+        batch_size = self._derivative_batch(spins)
+        self._last_jacobian_batch = batch_size
+        if batch_size >= nsamples:
+            yield from self._differentiate(spins, first_block)
+            return
+
+        # Keep only this sample batch's activations. Write its derivatives
+        # into full-size parameter blocks before centering across samples.
+        blocks = {}
+        for start in range(0, nsamples, batch_size):
+            end = min(start + batch_size, nsamples)
+            for i, jac in self._differentiate(spins[start:end], first_block):
+                if i not in blocks:
+                    blocks[i] = jac.new_empty((nsamples, jac.shape[1]))
+                blocks[i][start:end].copy_(jac)
+        for i in tuple(blocks):
+            yield i, blocks.pop(i)
 
     def jacobian_blocks(self, spins):
         """Yield state-dtype logarithmic derivatives in reverse network order."""
@@ -206,10 +277,14 @@ class MinSR(TDVP):
         group = self.process_group
         rank = 0 if group is None else distributed.get_rank(group)
         world = 1 if group is None else distributed.get_world_size(group)
-        real_single_device = group is None and self.vs_type == 0
-        tile = _gram_tile(T) if real_single_device else 0
-        ada_syrk = real_single_device and _ada_gram_syrk(self.state, T)
-        self._ada_gram_requested = ada_syrk
+        tile = 128 if size <= 1024 else 256 if size <= 4096 else 512
+        tune = (group is None and self.vs_type == 0 and T.is_cuda and dtype == torch.float64 and size >= 512
+                and not torch.are_deterministic_algorithms_enabled()
+                and not (torch.is_grad_enabled() and samples.reweight_factor.requires_grad))
+        if tune:
+            with torch.cuda.device(T.device):
+                tune = not torch.cuda.is_current_stream_capturing()
+        backend = "full GEMM"
         mirror = False
         lower_only = False
         blocks = self._native_jacobian_blocks if _native_cache else self.jacobian_blocks
@@ -219,14 +294,17 @@ class MinSR(TDVP):
             if i % world == rank:
                 block = self._normalized_block(jac, samples.reweight_factor)
                 wide = block.shape[1] >= 4096
-                if wide and (tile or ada_syrk) and 512 <= size <= 1024 and add_gram_lower_(T, block):
+                if tune and len(means) == 1 and wide:
+                    key = (T.device, block.shape)
+                    if key not in self._gram_backend_choices:
+                        with torch.cuda.device(T.device):
+                            self._gram_backend_choices[key] = tune_gram(T, block, tile)
+                    backend = self._gram_backend_choices[key]
+                if wide and backend == "cuBLAS SYRK" and add_gram_lower_(T, block):
                     lower_only = True
                     self._gram_backends.add("cuBLAS SYRK")
-                elif wide and tile:
-                    # Below-diagonal tile columns plus full diagonal tiles.
-                    for start in range(0, size, tile):
-                        end = min(start + tile, size)
-                        T[start:, start:end].addmm_(block[start:], block[start:end].mT)
+                elif wide and backend == "tiled GEMM":
+                    add_gram_tiled_(T, block, tile)
                     mirror = True
                     self._gram_backends.add("tiled GEMM")
                 else:
@@ -236,23 +314,25 @@ class MinSR(TDVP):
                     _blocks.append(raw if _native_cache else block)
         if not means:
             raise ValueError("MinSR requires trainable parameters.")
-        if lower_only:
-            T = T.tril() + T.tril(-1).mT
-        elif mirror:
-            # Reconstruct the missing off-diagonal tiles in-place, including
-            # contributions from small blocks accumulated with full GEMMs.
-            for start in range(tile, size, tile):
-                end = min(start + tile, size)
-                T[:start, start:end].copy_(T[start:end, :start].mT)
+        if lower_only or mirror:
+            mirror_gram_(T, tile, lower_only)
         if group is not None:
             distributed.all_reduce(T, group=group)
         self._Omean = torch.cat(means[::-1])
         return T
 
     def _adjoint_blocks(self, samples, v, limit=None):
+        if limit == 0:
+            return []
         blocks = []
         weight = samples.reweight_factor
-        for _, jac in islice(self.jacobian_blocks(samples.spins), limit):
+        if limit is None or type(self) is not MinSR:
+            jacobians = islice(self.jacobian_blocks(samples.spins), limit)
+        else:
+            first = sum(len(blocks) for _, blocks, _ in self._layers) - limit
+            jacobians = self._native_jacobian_blocks(samples.spins, first)
+        for _, jac in jacobians:
+            jac = jac.to(self.state.dtype)
             block = self._normalized_block(jac, weight)
             blocks.append(block.mH @ v)
         return blocks[::-1]
@@ -278,14 +358,26 @@ class MinSR(TDVP):
         weights = gather(samples._unnormalized_weight)
         return Samples(gather(samples.spins), gather(samples.wave_function), weights / weights.mean())
 
+    def _cache_budget(self, samples, element_size):
+        device = samples.spins.device
+        try:
+            available, total = _cuda_memory(device)
+        except RuntimeError:
+            return _DERIVATIVE_CACHE_BYTES
+        # Account for the Gram, eigensolver copies/workspace, and allocator headroom.
+        solve_reserve = 3 * samples.nsamples**2 * element_size + max(512 * 2**20, total // 10)
+        return max(0, int(available) - solve_reserve)
+
     def _cache_plan(self, samples, element_size):
         if (type(self) is not MinSR or self.process_group is not None or self.state.device.type != "cuda"
                 or self.vs_type != 0 or self._complex_params):
             return None, None
         params = tuple(self.state.parameters())
         elements = samples.nsamples * sum(p.numel() for p in params)
-        budget = _DERIVATIVE_CACHE_BYTES
-        if elements * element_size <= budget:
+        budget = self._cache_budget(samples, element_size)
+        if self._cache_limit is not None:
+            budget = min(budget, self._cache_limit)
+        if elements * element_size <= min(budget, _DERIVATIVE_CACHE_BYTES):
             return "normalized", None
         if self.state.dtype != torch.float64 or not all(p.dtype == torch.float32 for p in params):
             return None, None
@@ -305,10 +397,46 @@ class MinSR(TDVP):
 
     @torch.no_grad()
     def get_step(self, samples):
-        self._vjp_backends.clear()
-        self._gram_backends.clear()
         samples = self._gather_samples(samples)
         Ebar = self.get_Ebar(samples)
+        if self.state.device.type != "cuda" or self.process_group is not None:
+            return self._step_from_energy(samples, Ebar)
+
+        initial_batch_limit = self._jacobian_batch_limit
+        initial_cache_limit = self._cache_limit
+        try:
+            while True:
+                try:
+                    return self._step_from_energy(samples, Ebar)
+                except torch.cuda.OutOfMemoryError as error:
+                    current = self._last_jacobian_batch or min(
+                        self._jacobian_batch_limit or samples.nsamples,
+                        self.jacobian_batch or samples.nsamples, samples.nsamples,
+                    )
+                    expanded_cache = self._cache_limit is None and self._last_cache_plan[0] == "native"
+                    if current <= 1 and not expanded_cache:
+                        raise
+                    message = str(error)
+                # Release references held by the failed attempt before
+                # returning unused CUDA allocator blocks to the driver.
+                torch.cuda.empty_cache()
+                if expanded_cache:
+                    self._cache_limit = _DERIVATIVE_CACHE_BYTES
+                    self._logger.warning("MinSR CUDA out of memory. Retrying with a smaller derivative cache.")
+                    continue
+                self._jacobian_batch_limit = _retry_batch(current, message, Ebar.device)
+                self._logger.warning(
+                    f"MinSR CUDA out of memory. Retrying with Jacobian batch={self._jacobian_batch_limit} (was {current})"
+                )
+        except BaseException:
+            self._jacobian_batch_limit = initial_batch_limit
+            self._cache_limit = initial_cache_limit
+            raise
+
+    def _step_from_energy(self, samples, Ebar):
+        self._last_jacobian_batch = None
+        self._vjp_backends.clear()
+        self._gram_backends.clear()
         cache, retain_before = self._cache_plan(samples, Ebar.element_size())
         self._last_cache_plan = cache, retain_before
         if cache is None:
@@ -337,25 +465,12 @@ class MinSR(TDVP):
 
     def log_backends(self, logger):
         vjp = ", ".join(sorted(self._vjp_backends))
-        if "periodic weight gradient" not in self._vjp_backends:
-            if cuda_capability(self.state.device) == (8, 9):
-                vjp += " (periodic weight gradient requires the validated sm_89 shape and Triton runtime)"
-            elif supports_tuned_kernels(self.state.device):
-                vjp += " (periodic weight-gradient requirements were not met)"
-            else:
-                vjp += " (periodic weight gradient unavailable on this device/runtime)"
         gram = ", ".join(sorted(self._gram_backends))
-        if self._gram_backends == {"full GEMM"}:
-            if self._ada_gram_requested:
-                gram += " (no block qualified for cuBLAS SYRK)"
-            elif cuda_capability(self.state.device) == (8, 9):
-                gram += " (outside the validated sm_89 triangular Gram range)"
-            else:
-                gram += " (triangular Gram requirements were not met)"
         cache, retained = self._last_cache_plan
-        cache_status = "off"
-        if cache is not None:
-            blocks = "all blocks" if retained is None else f"{retained} blocks"
-            cache_status = f"{cache}, {blocks}"
-        logger.info("CUDA MinSR derivatives: %s | derivative cache: %s", vjp, cache_status)
-        logger.info("CUDA MinSR Gram: %s", gram)
+        cache_status = cache or "off"
+        if retained is not None:
+            cache_status += f" ({retained} blocks)"
+        batch = self._last_jacobian_batch
+        detail = f" | {batch} samples/batch" if batch is not None else ""
+        logger.info(f"CUDA MinSR derivatives: {vjp} | cache={cache_status}{detail}")
+        logger.info(f"CUDA MinSR Gram: {gram}")

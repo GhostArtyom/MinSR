@@ -8,6 +8,8 @@
 
 [examples/train_tutorial.py](../examples/train_tutorial.py) 把 5 个教程的训练流程放进一个脚本。开头设置 `TUTORIAL` 为 `ising`、`heisenberg`、`j1j2`、`triangular` 或 `excited`，再修改 `PRESETS` 中对应教程的字典；默认运行 4×4 的 J1-J2 模型。构型、耦合、对称性、网络和分阶段训练设置都放在预设内，采样、精度、保存和 ED 设置放在其后的共用参数区。每类参数都有中文注释；“从所选预设读取参数”以下的代码通常无需修改。原 Notebook 保持不变。
 
+教程使用装有 QuSpin 的 JAX 环境。以下命令以 Python 3.11 / JAX 0.6.2 环境为例。[安装说明](../README.md#installation)
+
 ```bash
 environments/py311-jax062/.venv/bin/python -m examples.train_tutorial
 ```
@@ -33,7 +35,7 @@ environments/py311-jax062/.venv/bin/python -m examples.train_tutorial
 
 脚本先在完整 Hilbert 空间求全局基态，再开始训练，把能量及收敛残差缓存在 `.cache/tutorial_ed/`。缓存按实际哈密顿量、晶格、边界和对称性区分；更换网络、层数或训练步数会复用同一体系的基态能量。激发态教程另求包含 CNN 动量的目标扇区最低能量，与全局基态分别缓存、分别画线。这个扇区基准适用于最后训练的扇区，第一阶段可能只施加其中部分约束。
 
-每次运行创建独立的 `runs/<体系和格点名>/<运行时间>/`，例如 `runs/j1j2_square_4x4_J1-1_J2-0.5/<运行时间>/`。以下输出链接指向生成代码。目录内保存 [`training.log`](../quantax/utils/logger.py#L12)、[`config.json`](../examples/train_tutorial.py#L228)、[`references.json`](../examples/train_tutorial.py#L314)、逐条写入并刷新的 [`training.csv`](../examples/train_tutorial.py#L317)、各阶段的最终权重 [`params_<阶段>_final.eqx`](../examples/train_tutorial.py#L366) 和 [`summary.json`](../examples/train_tutorial.py#L398)。日志记录运行配置、硬件和各阶段的训练进度。CSV 记录总能量、每格点能量、总能量方差、相对全局基态的每格点能量差和耗时。第 0 条记录对应初始参数；每阶段还额外测量一次最终更新后的状态，因此有“更新次数 + 1”条记录。采样能量存在统计涨落，曲线不保证单调，也可能短暂低于精确值。Ising 的精确训练与采样训练使用不同初始化。
+每次运行创建独立的 `runs/<体系和格点名>/<运行时间>/`，例如 `runs/j1j2_square_4x4_J1-1_J2-0.5/<运行时间>/`。目录内保存 `training.log`、`config.json`、`references.json`、逐条写入并刷新的 `training.csv`、各阶段的最终权重 `params_<阶段>_final.eqx` 和 `summary.json`。日志记录运行配置、硬件和各阶段的训练进度。CSV 记录总能量、每格点能量、总能量方差、相对全局基态的每格点能量差和耗时。第 0 条记录对应初始参数；每阶段还额外测量一次最终更新后的状态，因此有“更新次数 + 1”条记录。采样能量存在统计涨落，曲线不保证单调，也可能短暂低于精确值。Ising 的精确训练与采样训练使用不同初始化。[输出生成代码](../examples/train_tutorial.py)
 
 运行目录中的时间使用 `YYYYMMDD_HHMMSS`，精确到秒。
 

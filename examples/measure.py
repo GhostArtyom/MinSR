@@ -27,6 +27,7 @@ import jax
 import quantax as qtx
 from quantax.symmetry import TotalSz, SpinInverse, C4v
 from quantax.utils import create_run, close_run, log_devices, log_progress
+from quantax.utils.logger import thermalization_progress
 
 ROOT = Path(__file__).resolve().parents[1]
 # Each preset specifies depth, channels, and the matching supplied weights.
@@ -68,6 +69,7 @@ def _measure(
         )
         sampler = qtx.sampler.NeighborExchange(
             state, NSAMPLES, thermal_steps=THERMAL_STEPS, sweep_steps=SWEEP_STEPS, n_neighbor=[1, 2],
+            thermal_progress=thermalization_progress(logger, start_time),
         )
         jax.block_until_ready(sampler.current_wf)
         energy_data = qtx.utils.DataTracer()

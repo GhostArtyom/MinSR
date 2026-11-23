@@ -32,24 +32,30 @@ class Config:
     nsamples: int = 1000
     step_size: float = 1e-3
     max_parallel: int = 32768
-    projected_forward_batch: int = 1024  # CUDA inference only; counts orbit members.
+    projected_forward_batch: int | None = None  # None tunes local energy and uses 1024 for sampling.
     projected_periodic_conv: bool = True  # IEEE FP32 periodic convolution on supported CUDA GPUs.
     projected_local_energy_graph: bool = True  # Replay full batches of connected configurations.
     projected_exchange_graph: bool = True  # Replay compacted CUDA exchange proposals.
     ordinary_periodic_conv: bool = True  # For supported CUDA shapes; does not change the backward pass.
-    jacobian_batch: int = 8
+    jacobian_batch: int | None = None
     seed: int = 2347
     device: str = "cuda"
     output_dir: Path = ROOT / "runs" / "torch"
+    eigh_backend: str | None = None
 
     def __post_init__(self):
         if self.L < 2 or self.L % 2:
             raise ValueError("This square-lattice example needs an even L with L >= 2.")
         if self.depth < 2 or self.depth % 2:
             raise ValueError("depth must be positive and even.")
-        if min(self.channels, self.kernel_size, self.nsamples, self.max_parallel,
-               self.projected_forward_batch, self.jacobian_batch) < 1:
+        if min(self.channels, self.kernel_size, self.nsamples, self.max_parallel) < 1:
             raise ValueError("Network and batch sizes must be positive.")
+        if self.jacobian_batch is not None and self.jacobian_batch < 1:
+            raise ValueError("jacobian_batch must be positive.")
+        if self.projected_forward_batch is not None and self.projected_forward_batch < 1:
+            raise ValueError("projected_forward_batch must be positive.")
+        if self.eigh_backend not in (None, "default", "cusolver", "magma"):
+            raise ValueError("eigh_backend must be default, cusolver, or magma.")
         if not all(math.isfinite(x) for x in (self.J1, self.J2, self.step_size)) or self.step_size <= 0:
             raise ValueError("The couplings must be finite and step_size must be finite and positive.")
 
@@ -85,12 +91,18 @@ PRESETS = {
 def add_common_options(parser):
     defaults = Config()
     for name in ("L", "J1", "J2", "depth", "channels", "kernel_size", "nsamples",
-                 "step_size", "max_parallel", "projected_forward_batch", "jacobian_batch",
+                 "step_size", "max_parallel",
                  "seed", "device", "output_dir"):
         value = getattr(defaults, name)
         kind = Path if isinstance(value, Path) else type(value)
         flag = name.lower().replace("_", "-")
         parser.add_argument(f"--{flag}", dest=name, type=kind, default=value)
+    parser.add_argument("--projected-forward-batch", type=int, default=defaults.projected_forward_batch,
+                        help="Fix the projected CUDA forward batch in orbit members. By default local energy tunes it.")
+    parser.add_argument("--jacobian-batch", type=int, default=defaults.jacobian_batch,
+                        help="Samples per MinSR derivative batch. Defaults to an estimate from GPU memory.")
+    parser.add_argument("--eigh-backend", choices=("default", "cusolver", "magma"), default=defaults.eigh_backend,
+                        help="Select the CUDA linear algebra backend for the training process.")
     parser.add_argument("--projected-periodic-conv", action=argparse.BooleanOptionalAction,
                         default=defaults.projected_periodic_conv)
     parser.add_argument("--projected-local-energy-graph", action=argparse.BooleanOptionalAction,

@@ -183,7 +183,6 @@ dependencies = [
     { name = "numba" },
     { name = "numexpr" },
     { name = "numpy" },
-    { name = "quspin" },
     { name = "scipy" },
     { name = "six" },
     { name = "torch" },
@@ -198,7 +197,6 @@ requires-dist = [
     { name = "numba", specifier = "==0.59.0" },
     { name = "numexpr", specifier = "==2.8.7" },
     { name = "numpy", specifier = "==1.26.3" },
-    { name = "quspin", path = "../QuSpin/dist/quspin-0.3.7-cp311-cp311-linux_x86_64.whl" },
     { name = "scipy", specifier = "==1.13.1" },
     { name = "six", specifier = ">=1.17.0" },
     { name = "torch", specifier = "==2.10.0", index = "https://download.pytorch.org/whl/cu128" },
@@ -431,14 +429,6 @@ dependencies = [
 sdist = { url = "https://mirrors.sustech.edu.cn/pypi/web/packages/18/39/b3927f3616f6223832f9b760e4208e8a7c7e1dea2b4d9ad7d32a5d214c3a/python_dateutil-4.0.0.tar.gz", hash = "sha256:d7295ff14fdc0f92f662100bfb6c551d160ca090f2939f1ec5b9794265c03f06" }
 wheels = [
     { url = "https://mirrors.sustech.edu.cn/pypi/web/packages/2f/a9/52b89563d154433d79b51ed1eb4842bf7334cb2696891a7fe135618853d7/python_dateutil-4.0.0-py3-none-any.whl", hash = "sha256:a5e246f79eb80475e691bf93862cead98decd8a498cf53ba0516fcdc0f50dc1c" },
-]
-
-[[package]]
-name = "quspin"
-version = "0.3.7"
-source = { path = "../QuSpin/dist/quspin-0.3.7-cp311-cp311-linux_x86_64.whl" }
-wheels = [
-    { filename = "quspin-0.3.7-cp311-cp311-linux_x86_64.whl", hash = "sha256:55f90bbec97e5ca4bfcc53faf8e80dd0431ac7ecd947cc08eab21e79683efedb" },
 ]
 
 [[package]]

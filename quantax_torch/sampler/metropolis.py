@@ -5,9 +5,24 @@ from .sampler import Sampler, SamplerStatus
 from ..utils.spins import rand_spins
 
 
+_COMPACT_GRAPH_BATCHES = 32
+
+
+def _track_proposals(uniforms, progress):
+    total = len(uniforms)
+    for step, uniform in enumerate(uniforms, 1):
+        yield uniform
+        if step % 100 == 0 or step == total:
+            if uniform.is_cuda:
+                torch.cuda.current_stream(uniform.device).synchronize()
+            progress(step, total)
+
+
 class Metropolis(Sampler):
+    """Metropolis sampling with optional progress every 100 thermalization proposals."""
+
     def __init__(self, state, nsamples, reweight=2.0, thermal_steps=None,
-                 sweep_steps=None, initial_spins=None, *, generator=None):
+                 sweep_steps=None, initial_spins=None, *, generator=None, thermal_progress=None):
         super().__init__(state, nsamples, reweight, generator=generator)
         self.thermal_steps = 20 * self.nsites if thermal_steps is None else thermal_steps
         self.sweep_steps = 2 * self.nsites if sweep_steps is None else sweep_steps
@@ -15,6 +30,7 @@ class Metropolis(Sampler):
             raise ValueError("Sampling steps must be nonnegative.")
         self.initial_spins = initial_spins
         self._rows = torch.arange(nsamples, device=state.device)
+        self._thermal_progress = thermal_progress
         self.reset()
 
     @torch.no_grad()
@@ -32,7 +48,10 @@ class Metropolis(Sampler):
         # The reference sampler makes one initial proposal before thermalization.
         spins, proposal = self._propose(spins)
         self._status = SamplerStatus(spins, propose_prob=proposal)
-        self.sweep(self.thermal_steps)
+        if self._thermal_progress is None:
+            self.sweep(self.thermal_steps)
+        else:
+            self.sweep(self.thermal_steps, progress=self._thermal_progress)
 
     @staticmethod
     def _update(old, new, uniform):
@@ -52,23 +71,26 @@ class Metropolis(Sampler):
         wf = self.state(proposal)
         return self._update(status, SamplerStatus(proposal, wf, wf.abs().pow(self.reweight), proposal_prob), uniform)
 
-    def _proposals(self, status, uniforms):
-        for uniform in uniforms:
+    def _proposals(self, status, uniforms, progress=None):
+        proposals = uniforms if progress is None else _track_proposals(uniforms, progress)
+        for uniform in proposals:
             status = self._advance(status, uniform)
         return status
 
     @torch.no_grad()
-    def sweep(self, nsweeps=None):
+    def sweep(self, nsweeps=None, *, progress=None):
         nsweeps = self.sweep_steps if nsweeps is None else nsweeps
         if nsweeps < 0:
             raise ValueError("nsweeps must be nonnegative.")
+        if progress is not None:
+            progress(0, nsweeps)
         spins = self.current_spins
         wf = self.state(spins)
         prob = wf.abs().pow(self.reweight)
         status = SamplerStatus(spins, wf, prob, self._status.propose_prob)
         uniforms = 1 - torch.rand((nsweeps, self.nsamples), generator=self.generator,
                                   dtype=prob.dtype, device=prob.device)
-        status = self._proposals(status, uniforms)
+        status = self._proposals(status, uniforms, progress)
         self._status = status
         return self._samples(status.spins, status.wave_function)
 
@@ -94,7 +116,7 @@ class NeighborExchange(Metropolis):
 
     def __init__(self, state, nsamples, reweight=2.0, thermal_steps=None,
                  sweep_steps=None, initial_spins=None, n_neighbor=1, *, generator=None,
-                 cuda_graph=False, skip_unchanged=False):
+                 cuda_graph=False, skip_unchanged=False, thermal_progress=None):
         if state.total_sz is None:
             raise ValueError("NeighborExchange requires a fixed magnetization sector.")
         shells = [n_neighbor] if isinstance(n_neighbor, int) else n_neighbor
@@ -105,7 +127,7 @@ class NeighborExchange(Metropolis):
         self._cuda_graph = None
         self._compact_key = None
         super().__init__(state, nsamples, reweight, thermal_steps, sweep_steps,
-                         initial_spins, generator=generator)
+                         initial_spins, generator=generator, thermal_progress=thermal_progress)
 
     def _pairs(self, spins, positions):
         if positions is None:
@@ -151,33 +173,22 @@ class NeighborExchange(Metropolis):
                 or getattr(state, "inference_fn", None) is None or torch.are_deterministic_algorithms_enabled()
                 or torch.is_autocast_enabled("cuda")):
             return None
-        from ..nn._cuda_support import cuda_capability, triton_runtime_issue, validated_ada_res_sum
+        from ..nn._cuda_support import periodic_cuda_issue
         from ..state import Variational
         from ..symmetry import Symmetry
 
         if (type(state) is not Variational or type(state.symm) is not Symmetry
-                or not (state._default_input and state._default_output)):
+                or len(state.ansatz) != 1 or not (state._default_input and state._default_output)):
             return None
-        capability = cuda_capability(state.device)
-        if capability == (8, 9):
-            if (self.reweight not in (1.0, 2.0) or state.nsymm != 16
-                    or state.forward_batch != 1024 or state.dtype != torch.float64
-                    or not validated_ada_res_sum(getattr(state.ansatz[0], "config", None),
-                                                 getattr(state.symm.sites, "shape", ()),
-                                                 self.nsamples, state.max_parallel)):
-                return None
-        elif capability != (12, 0):
-            return None
-        if triton_runtime_issue() is not None:
+        if periodic_cuda_issue(state.device) is not None:
             return None
         from ..nn._periodic_cuda import counted_res_sum_forward, res_sum_forward, supports_counted_res_sum
 
         if state.inference_fn is not res_sum_forward or not supports_counted_res_sum(state.ansatz[0]):
             return None
-        cap = state.forward_batch
-        batch = self.nsamples if cap is None else cap // state.nsymm
-        # Bound the capture size: one subgraph per possible inference chunk.
-        if batch <= 0 or self.nsamples > 32 * batch or min(batch, self.nsamples) * state.nsymm > 2048:
+        cap = min(state.forward_batch or 2048, 2048)
+        batch = cap // state.nsymm
+        if batch <= 0:
             return None
         return counted_res_sum_forward, batch
 
@@ -186,11 +197,12 @@ class NeighborExchange(Metropolis):
         spins = status.spins
         pairs = self._pairs(spins, positions)
         left, right = pairs.unbind(dim=1)
-        changed = spins[self._rows, left] != spins[self._rows, right]
+        rows = self._rows[:len(spins)]
+        changed = spins[rows, left] != spins[rows, right]
         count = changed.sum(dtype=torch.int32)
         # Keep storage addresses and launch sizes fixed. The convolution
         # kernels skip padding using the true count, read on the device.
-        chosen = torch.nonzero_static(changed, size=self.nsamples, fill_value=-1).flatten().clamp_min_(0)
+        chosen = torch.nonzero_static(changed, size=len(spins), fill_value=-1).flatten().clamp_min_(0)
         proposal = self._exchange(spins[chosen], pairs[chosen])
         values = []
         for offset, chunk in enumerate(proposal.split(batch)):
@@ -209,14 +221,14 @@ class NeighborExchange(Metropolis):
         proposal_prob = torch.where(changed, 1.0, status.propose_prob)
         return self._update(status, SamplerStatus(next_spins, wave, prob, proposal_prob), uniform)
 
-    def _proposals(self, status, uniforms):
+    def _proposals(self, status, uniforms, progress=None):
         if not self._use_cuda_graph or not len(uniforms):
-            return super()._proposals(status, uniforms)
+            return super()._proposals(status, uniforms, progress)
         if self._skip_unchanged:
             backend = self._compact_backend()
             if backend is None:
                 self._cuda_graph = self._compact_key = None
-                return super()._proposals(status, uniforms)
+                return super()._proposals(status, uniforms, progress)
             forward, batch = backend
             state = self.state
             net = state.ansatz[0]
@@ -224,18 +236,22 @@ class NeighborExchange(Metropolis):
             # after changes to the network storage or to the batch split.
             tensors = (self.neighbors, self._rows, state._maximum, *net.parameters(), *net.buffers(),
                        *state.symm._on_device(status.spins.device))
-            key = (batch, state.nsymm, id(net), id(state.symm), id(state.input_fn), id(state.output_fn),
+            capacity = _COMPACT_GRAPH_BATCHES * batch
+            key = (batch, capacity, state.nsymm, id(net), id(state.symm), id(state.input_fn), id(state.output_fn),
                    id(self.generator), self.reweight,
                    tuple((x.data_ptr(), x.shape, x.stride(), x.dtype) for x in tensors))
             if self._cuda_graph is None or self._compact_key != key:
                 def advance(old, uniform, positions=None):
                     return self._advance_compact(old, uniform, positions, forward, batch)
 
-                self._cuda_graph = _ExchangeGraph(self, status, uniforms[0], advance=advance)
+                if self.nsamples <= capacity:
+                    self._cuda_graph = _ExchangeGraph(self, status, uniforms[0], advance=advance)
+                else:
+                    self._cuda_graph = _ChunkedExchangeGraph(self, status, uniforms[0], advance, capacity)
                 self._compact_key = key
         elif self._cuda_graph is None:
             self._cuda_graph = _ExchangeGraph(self, status, uniforms[0])
-        return self._cuda_graph(status, uniforms)
+        return self._cuda_graph(status, uniforms, progress)
 
 
 class _ExchangeGraph:
@@ -243,12 +259,13 @@ class _ExchangeGraph:
 
     _fields = ("spins", "wave_function", "prob", "propose_prob")
 
-    def __init__(self, sampler, status, uniform, *, advance=None):
+    def __init__(self, sampler, status, uniform, *, advance=None, external_positions=False):
         advance = sampler._advance if advance is None else advance
         self.status = SamplerStatus(*(getattr(status, name).clone() for name in self._fields))
         self.uniform = uniform.clone()
         device = status.spins.device
-        positions = torch.zeros(sampler.nsamples, device=device, dtype=torch.long)
+        positions = torch.zeros(len(status.spins), device=device, dtype=torch.long)
+        self.positions = positions if external_positions else None
         maximum = sampler.state._maximum.clone()
         stream = torch.cuda.Stream(device=device)
         stream.wait_stream(torch.cuda.current_stream(device))
@@ -260,18 +277,58 @@ class _ExchangeGraph:
         torch.cuda.current_stream(device).wait_stream(stream)
         with torch.cuda.device(device):
             self.graph = torch.cuda.CUDAGraph()
-            self.graph.register_generator_state(sampler.generator)
+            if self.positions is None:
+                self.graph.register_generator_state(sampler.generator)
             with torch.cuda.graph(self.graph, stream=stream):
-                self._copy(advance(self.status, self.uniform))
+                self._copy(advance(self.status, self.uniform, self.positions))
 
     def _copy(self, status):
         for name in self._fields:
             getattr(self.status, name).copy_(getattr(status, name))
 
-    def __call__(self, status, uniforms):
+    def advance_chunk(self, status, uniform, positions):
         self._copy(status)
-        for uniform in uniforms:
+        self.uniform.copy_(uniform)
+        self.positions.copy_(positions)
+        self.graph.replay()
+        for name in self._fields:
+            getattr(status, name).copy_(getattr(self.status, name))
+
+    def __call__(self, status, uniforms, progress=None):
+        self._copy(status)
+        proposals = uniforms if progress is None else _track_proposals(uniforms, progress)
+        for uniform in proposals:
             self.uniform.copy_(uniform)
             self.graph.replay()
         # Samples returned to the caller must not alias the replay buffers.
         return SamplerStatus(*(getattr(self.status, name).clone() for name in self._fields))
+
+
+class _ChunkedExchangeGraph:
+    """Reuse a fixed-capacity capture across independent groups of chains."""
+
+    def __init__(self, sampler, status, uniform, advance, capacity):
+        self.capacity = capacity
+        self.sampler = sampler
+        fields = _ExchangeGraph._fields
+        self.graphs = {}
+        for n in (capacity, len(uniform) % capacity):
+            if n:
+                first = SamplerStatus(*(getattr(status, name)[:n] for name in fields))
+                self.graphs[n] = _ExchangeGraph(sampler, first, uniform[:n], advance=advance, external_positions=True)
+
+    def __call__(self, status, uniforms, progress=None):
+        fields = _ExchangeGraph._fields
+        result = SamplerStatus(*(getattr(status, name).clone() for name in fields))
+        chunks = [SamplerStatus(*parts) for parts in zip(
+            *(getattr(result, name).split(self.capacity) for name in fields), strict=True
+        )]
+        proposals = uniforms if progress is None else _track_proposals(uniforms, progress)
+        for uniform in proposals:
+            # Preserve the full-chain random draw and its generator order.
+            positions = torch.randint(len(self.sampler.neighbors), uniform.shape, device=uniform.device,
+                                      generator=self.sampler.generator)
+            for chunk, draw, pairs in zip(chunks, uniform.split(self.capacity), positions.split(self.capacity),
+                                          strict=True):
+                self.graphs[len(draw)].advance_chunk(chunk, draw, pairs)
+        return result

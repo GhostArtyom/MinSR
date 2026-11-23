@@ -57,3 +57,44 @@ def add_gram_lower_(out, block):
     if status:
         raise RuntimeError(f"cuBLAS FP64 Gram update failed (status {status}).")
     return True
+
+
+def add_gram_tiled_(out, block, tile):
+    for start in range(0, len(out), tile):
+        end = min(start + tile, len(out))
+        out[start:, start:end].addmm_(block[start:], block[start:end].mT)
+
+
+def mirror_gram_(out, tile, lower_only):
+    for start in range(0, len(out), tile):
+        end = min(start + tile, len(out))
+        if lower_only:
+            diagonal = out[start:end, start:end]
+            diagonal.copy_(diagonal.tril() + diagonal.tril(-1).mT)
+        out[:start, start:end].copy_(out[start:end, :start].mT)
+
+
+def tune_gram(out, block, tile):
+    """Time each backend with the existing output buffer, before its first accumulation."""
+    timings = {}
+    start, stop = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+    for backend in ("full GEMM", "tiled GEMM", "cuBLAS SYRK"):
+        out.zero_()
+        start.record()
+        if backend == "full GEMM":
+            out.addmm_(block, block.mT)
+        elif backend == "tiled GEMM":
+            add_gram_tiled_(out, block, tile)
+            mirror_gram_(out, tile, False)
+        else:
+            if not add_gram_lower_(out, block):
+                continue
+            mirror_gram_(out, tile, True)
+        stop.record()
+        stop.synchronize()
+        timings[backend] = start.elapsed_time(stop)
+    out.zero_()
+    best = min(timings, key=timings.get)
+    if timings[best] >= 0.95 * timings["full GEMM"]:
+        return "full GEMM"
+    return best

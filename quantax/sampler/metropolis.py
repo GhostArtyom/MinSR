@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, Union, Sequence
+from typing import Callable, Optional, Tuple, Union, Sequence
 from functools import partial
 import jax
 import jax.numpy as jnp
@@ -11,6 +11,8 @@ from ..utils import to_array_shard, rand_spins
 
 
 class Metropolis(Sampler):
+    """Metropolis sampling with optional progress every 100 thermalization proposals."""
+
     def __init__(
         self,
         state: State,
@@ -19,6 +21,8 @@ class Metropolis(Sampler):
         thermal_steps: Optional[int] = None,
         sweep_steps: Optional[int] = None,
         initial_spins: Optional[jax.Array] = None,
+        *,
+        thermal_progress: Optional[Callable[[int, int], None]] = None,
     ):
         if nsamples % jax.local_device_count():
             raise ValueError(
@@ -35,6 +39,7 @@ class Metropolis(Sampler):
         else:
             self._sweep_steps = sweep_steps
         self._initial_spins = initial_spins
+        self._thermal_progress = thermal_progress
         self.reset()
 
     @property
@@ -53,24 +58,34 @@ class Metropolis(Sampler):
 
         spins, propose_prob = self._propose(get_subkeys(), spins)
         self._status = SamplerStatus(spins, propose_prob=propose_prob)
-        self.sweep(self._thermal_steps)
+        if self._thermal_progress is None:
+            self.sweep(self._thermal_steps)
+        else:
+            self.sweep(self._thermal_steps, progress=self._thermal_progress)
 
-    def sweep(self, nsweeps: Optional[int] = None) -> Samples:
+    def sweep(
+        self, nsweeps: Optional[int] = None, *, progress: Optional[Callable[[int, int], None]] = None
+    ) -> Samples:
+        if nsweeps is None:
+            nsweeps = self._sweep_steps
+        if progress is not None:
+            progress(0, nsweeps)
         spins = self.current_spins
         wf = self._state(spins)
         prob = jnp.abs(wf) ** self._reweight
         self._status = SamplerStatus(spins, wf, prob, self._status.propose_prob)
 
-        if nsweeps is None:
-            nsweeps = self._sweep_steps
         keys_propose = get_subkeys(nsweeps)
         keys_update = get_subkeys(nsweeps)
-        for keyp, keyu in zip(keys_propose, keys_update):
+        for step, (keyp, keyu) in enumerate(zip(keys_propose, keys_update), 1):
             new_spins, new_propose_prob = self._propose(keyp, self.current_spins)
             new_wf = self._state(new_spins)
             new_prob = jnp.abs(new_wf) ** self._reweight
             new_status = SamplerStatus(new_spins, new_wf, new_prob, new_propose_prob)
             self._status = self._update(keyu, self._status, new_status)
+            if progress is not None and (step % 100 == 0 or step == nsweeps):
+                jax.block_until_ready(self.current_wf)
+                progress(step, nsweeps)
         return Samples(self.current_spins, self.current_wf, self._reweight)
 
     def _propose(
@@ -121,6 +136,8 @@ class NeighborExchange(Metropolis):
         sweep_steps: Optional[int] = None,
         initial_spins: Optional[jax.Array] = None,
         n_neighbor: Union[int, Sequence[int]] = 1,
+        *,
+        thermal_progress: Optional[Callable[[int, int], None]] = None,
     ):
         if state.total_sz is None:
             raise ValueError("The 'total_sz' of 'state' should be specified.")
@@ -129,7 +146,8 @@ class NeighborExchange(Metropolis):
         self._neighbors = jnp.concatenate(neighbors, axis=0)
 
         super().__init__(
-            state, nsamples, reweight, thermal_steps, sweep_steps, initial_spins
+            state, nsamples, reweight, thermal_steps, sweep_steps, initial_spins,
+            thermal_progress=thermal_progress,
         )
 
     @partial(jax.jit, static_argnums=0)

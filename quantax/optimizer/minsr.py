@@ -1,5 +1,8 @@
+import logging
+import re
 from typing import Optional, Callable, Tuple, List, Any
 from functools import partial
+from operator import index
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -15,12 +18,39 @@ from ..utils import tree_fully_flatten, to_array_shard, array_extend
 from ..global_defs import get_default_dtype
 
 
+def _retry_batch(batch_size, message, devices):
+    request = re.search(r"allocate (\d+) bytes", message)
+    if request is not None:
+        requested = int(request[1])
+        try:
+            stats = [device.memory_stats() or {} for device in devices]
+        except RuntimeError:
+            stats = []
+        if stats and all("bytes_limit" in item and "bytes_in_use" in item for item in stats):
+            available = min(item["bytes_limit"] - item["bytes_in_use"] for item in stats)
+            if 0 < available < requested:
+                # Estimate how many samples fit with 20% headroom. The
+                # failed allocation may also include fixed-size buffers.
+                return max(1, 4 * batch_size * available // (5 * requested))
+    return batch_size // 2
+
+
 class MinSR(TDVP):
+    """MinSR with optional per-sample batching of logarithmic derivatives.
+
+    ``jacobian_batch`` limits the number of sampled configurations in a
+    derivative batch. Centering and the dense solve still use all samples.
+    On GPU, a memory allocation failure can lower the batch for this optimizer.
+    """
+
     def __init__(
         self,
         state: Variational,
         hamiltonian: Operator,
         solver: Optional[Callable] = None,
+        *,
+        jacobian_batch: Optional[int] = None,
+        logger: Optional[logging.Logger] = None,
     ):
 
         if solver is None:
@@ -29,6 +59,13 @@ class MinSR(TDVP):
 
         if self.vs_type == 1:
             raise ValueError("'MinSR' optimizer doesn't support vs_type 1")
+
+        if jacobian_batch is not None:
+            jacobian_batch = index(jacobian_batch)
+            if jacobian_batch < 1:
+                raise ValueError("jacobian_batch must be positive.")
+        self._jacobian_batch = jacobian_batch
+        self._logger = logger if logger is not None else logging.getLogger(__name__)
 
         self._nodes = []
         params, others = state.partition(state.ansatz)
@@ -157,6 +194,38 @@ class MinSR(TDVP):
 
         return init_vals
 
+    @eqx.filter_jit
+    def _batched_jacobians(self, ansatz, spins, batch_size):
+        nsamples, nsites = spins.shape
+        nbatches = (nsamples + batch_size - 1) // batch_size
+        batch_size = (nsamples + nbatches - 1) // nbatches
+        padding = nbatches * batch_size - nsamples
+        if padding:
+            # Duplicate a valid configuration and discard its derivative
+            # before any sample means or weighted reductions are computed.
+            spins = jnp.pad(spins, ((0, padding), (0, 0)), mode="edge")
+
+        def collect(jac, blocks):
+            return (*blocks, jac)
+
+        def differentiate(batch):
+            return self._reversed_scan_layers(ansatz, batch, collect, ())
+
+        batches = spins.reshape(nbatches, batch_size, nsites)
+        blocks = jax.lax.map(differentiate, batches)
+        return tuple(block.reshape(-1, block.shape[-1])[:nsamples] for block in blocks)
+
+    def _scan_layers(self, spins, fn_on_jac, init_vals):
+        ansatz = self.state.ansatz
+        batch_size = self._jacobian_batch
+        if batch_size is None or batch_size >= spins.shape[0]:
+            return self._reversed_scan_layers(ansatz, spins, fn_on_jac, init_vals)
+
+        blocks = list(reversed(self._batched_jacobians(ansatz, spins, batch_size)))
+        while blocks:
+            init_vals = fn_on_jac(blocks.pop(), init_vals)
+        return init_vals
+
     @partial(jax.jit, static_argnums=0, donate_argnums=1)
     def _get_Obar(self, Omat: jax.Array, reweight: jax.Array) -> jax.Array:
         # should be pmean here
@@ -191,9 +260,7 @@ class MinSR(TDVP):
 
         Omean = []
         init_vals = (Tmat, Omean, samples.reweight_factor)
-        Tmat, Omean, reweight = self._reversed_scan_layers(
-            self.state.ansatz, samples.spins, self._Tmat_scan_fn, init_vals
-        )
+        Tmat, Omean, reweight = self._scan_layers(samples.spins, self._Tmat_scan_fn, init_vals)
         self._Omean = jnp.concatenate(Omean[::-1])
         return Tmat
     
@@ -213,14 +280,45 @@ class MinSR(TDVP):
         Compute O^dag @ vec. vec @ jac is used instead of vjp for better precision.
         """
         init_vals = ([], samples.reweight_factor, vec)
-        outputs, reweight, vec = self._reversed_scan_layers(
-            self.state.ansatz, samples.spins, self._Ohvp_scan_fn, init_vals
-        )
+        outputs, reweight, vec = self._scan_layers(samples.spins, self._Ohvp_scan_fn, init_vals)
         outputs = jnp.concatenate(outputs[::-1])
         return outputs
 
     def get_step(self, samples: Samples) -> jax.Array:
         Ebar = self.get_Ebar(samples)
+        if isinstance(samples.spins, jax.core.Tracer):
+            return self._step_from_energy(samples, Ebar)
+        devices = samples.spins.sharding.device_set
+        if jax.process_count() != 1 or not any(d.platform in ("gpu", "cuda", "rocm") for d in devices):
+            return self._step_from_energy(samples, Ebar)
+
+        # Surface local-energy errors outside the derivative fallback. JAX
+        # may report asynchronous allocation errors when the result is ready.
+        jax.block_until_ready(Ebar)
+        initial_batch = self._jacobian_batch
+        try:
+            while True:
+                try:
+                    return jax.block_until_ready(self._step_from_energy(samples, Ebar))
+                except (RuntimeError, ValueError) as error:
+                    message = str(error).lower()
+                    oom = (
+                        ("resource_exhausted" in message and "out of memory" in message)
+                        or "cuda_error_out_of_memory" in message
+                    )
+                    current = min(self._jacobian_batch or samples.nsamples, samples.nsamples)
+                    if not oom or current <= 1:
+                        raise
+                self._jacobian_batch = _retry_batch(current, message, devices)
+                self._logger.warning(
+                    f"MinSR GPU out of memory. Retrying with derivative sample batch={self._jacobian_batch:d} "
+                    f"(was {current:d})"
+                )
+        except BaseException:
+            self._jacobian_batch = initial_batch
+            raise
+
+    def _step_from_energy(self, samples: Samples, Ebar: jax.Array) -> jax.Array:
         Tmat = self.get_Tmat(samples)
         step = self.solve(samples, Tmat, Ebar)
         step = self.build_step(step, self._Omean, self._energy)

@@ -22,10 +22,34 @@ def _sum_without_noise(inputs, tol_snr):
     return torch.where(abs_mean > 0, total / (1 + ratio.pow(6)), 0.0)
 
 
+def _release_eigh_cache(T):
+    if torch.version.cuda is None or torch.backends.cuda.preferred_linalg_library().name == "Magma":
+        return
+    device = T.device
+    matrix_bytes = T.numel() * T.element_size()
+    free, _ = torch.cuda.mem_get_info(device)
+    # A 10k FP64 solve used about five matrix sizes for eigenvectors and
+    # workspace. Allow one more matrix of headroom before keeping idle blocks.
+    if free < 6 * matrix_bytes:
+        stats = torch.cuda.memory_stats(device)
+        cached = (stats.get("reserved_bytes.all.current", 0) - stats.get("allocated_bytes.all.current", 0)
+                  - stats.get("inactive_split_bytes.all.current", 0))
+        if cached >= matrix_bytes:
+            torch.cuda.empty_cache()
+
+
 def minsr_pinv_eig(tol=None, atol=0.0, tol_snr=0.0):
     def solve(T, b):
-        if not bool(T.isfinite().all() & b.isfinite().all()):
+        large_cuda = T.is_cuda and T.ndim == 2 and T.dtype == torch.float64 and len(T) >= 8192
+        if large_cuda:
+            # Reduce directly over the FP64 matrix without a matrix-sized boolean mask.
+            finite = torch.linalg.vector_norm(T, ord=float("inf")).isfinite()
+        else:
+            finite = T.isfinite().all()
+        if not bool(finite & b.isfinite().all()):
             raise FloatingPointError("Non-finite matrix or right-hand side in the MinSR solve.")
+        if large_cuda:
+            _release_eigh_cache(T)
         vals, U = torch.linalg.eigh(T)
         inverse = _get_eigs_inv(vals, tol, atol)
         rhs = U.mH @ b if tol_snr <= 1e-6 else _sum_without_noise(U.conj() * b[:, None], tol_snr)
