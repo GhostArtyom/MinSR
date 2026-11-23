@@ -18,20 +18,27 @@ from ..utils import tree_fully_flatten, to_array_shard, array_extend
 from ..global_defs import get_default_dtype
 
 
+def _memory_headroom(devices):
+    try:
+        stats = [device.memory_stats() or {} for device in devices]
+    except RuntimeError:
+        return None
+    if not stats or any("bytes_limit" not in item or "bytes_in_use" not in item for item in stats):
+        return None
+    available = min(item["bytes_limit"] - item["bytes_in_use"] for item in stats)
+    return available, min(item["bytes_limit"] for item in stats)
+
+
 def _retry_batch(batch_size, message, devices):
     request = re.search(r"allocate (\d+) bytes", message)
-    if request is not None:
+    headroom = _memory_headroom(devices) if request else None
+    if headroom is not None:
+        available, _ = headroom
         requested = int(request[1])
-        try:
-            stats = [device.memory_stats() or {} for device in devices]
-        except RuntimeError:
-            stats = []
-        if stats and all("bytes_limit" in item and "bytes_in_use" in item for item in stats):
-            available = min(item["bytes_limit"] - item["bytes_in_use"] for item in stats)
-            if 0 < available < requested:
-                # Estimate how many samples fit with 20% headroom. The
-                # failed allocation may also include fixed-size buffers.
-                return max(1, 4 * batch_size * available // (5 * requested))
+        if 0 < available < requested:
+            # Estimate how many samples fit with 20% headroom. The
+            # failed allocation may also include fixed-size buffers.
+            return max(1, 4 * batch_size * available // (5 * requested))
     return batch_size // 2
 
 
@@ -40,7 +47,8 @@ class MinSR(TDVP):
 
     ``jacobian_batch`` limits the number of sampled configurations in a
     derivative batch. Centering and the dense solve still use all samples.
-    On GPU, a memory allocation failure can lower the batch for this optimizer.
+    On a single GPU, symmetry-projected states can start with a batch
+    estimated from available memory. A memory failure can lower the batch.
     """
 
     def __init__(
@@ -247,17 +255,37 @@ class MinSR(TDVP):
         Tmat += Obar @ Obar.conj().T
         return Tmat, Omean, reweight
 
-    def get_Tmat(self, samples: Samples) -> jax.Array:
-        Ns = samples.nsamples if self.vs_type == 0 else 2 * samples.nsamples
-        if self.vs_type == 0:
-            dtype = get_default_dtype()
-        else:
-            if get_default_dtype() in (jnp.float64, jnp.complex128):
-                dtype = jnp.float64
-            else:
-                dtype = jnp.float32
-        Tmat = jnp.zeros((Ns, Ns), dtype=dtype)
+    def _gram_shape_dtype(self, nsamples):
+        dtype = np.dtype(get_default_dtype())
+        if self.vs_type != 0:
+            nsamples *= 2
+            dtype = np.dtype(jnp.float64 if dtype in (jnp.float64, jnp.complex128) else jnp.float32)
+        return (nsamples, nsamples), dtype
 
+    def _initial_derivative_batch(self, nsamples, devices):
+        if len(devices) != 1 or self.state.nsymm == 1 or not self.state.nparams:
+            return None
+        headroom = _memory_headroom(devices)
+        if headroom is None:
+            return None
+        available, limit = headroom
+        (rows, cols), dtype = self._gram_shape_dtype(nsamples)
+        derivative_bytes = self.state.nparams * np.dtype(get_default_dtype()).itemsize
+        per_projected_sample = derivative_bytes * self.state.nsymm
+        # Leave space for the dense Gram and eigensolver, retained derivatives,
+        # centering temporaries, and other live GPU allocations.
+        fixed = 3 * rows * cols * dtype.itemsize + 2 * nsamples * derivative_bytes
+        budget = max(0, available - fixed - limit // 10)
+        if nsamples * per_projected_sample <= budget:
+            return None
+        # Keep additional workspace for the projected reverse pass once we batch.
+        return max(1, budget // (3 * per_projected_sample))
+
+    def get_Tmat(self, samples: Samples) -> jax.Array:
+        shape, dtype = self._gram_shape_dtype(samples.nsamples)
+        return self._fill_Tmat(samples, jnp.zeros(shape, dtype=dtype))
+
+    def _fill_Tmat(self, samples: Samples, Tmat: jax.Array) -> jax.Array:
         Omean = []
         init_vals = (Tmat, Omean, samples.reweight_factor)
         Tmat, Omean, reweight = self._scan_layers(samples.spins, self._Tmat_scan_fn, init_vals)
@@ -296,10 +324,18 @@ class MinSR(TDVP):
         # may report asynchronous allocation errors when the result is ready.
         jax.block_until_ready(Ebar)
         initial_batch = self._jacobian_batch
+        shape, dtype = self._gram_shape_dtype(samples.nsamples)
         try:
+            if initial_batch is None:
+                self._jacobian_batch = self._initial_derivative_batch(samples.nsamples, devices)
+                if self._jacobian_batch is not None:
+                    self._logger.info(f"MinSR derivative sample batch={self._jacobian_batch:d} (GPU memory estimate)")
             while True:
+                # A smaller derivative batch cannot shrink the dense Gram.
+                Tmat = jnp.zeros(shape, dtype=dtype).block_until_ready()
                 try:
-                    return jax.block_until_ready(self._step_from_energy(samples, Ebar))
+                    Tmat = self._fill_Tmat(samples, Tmat)
+                    return jax.block_until_ready(self._finish_step(samples, Tmat, Ebar))
                 except (RuntimeError, ValueError) as error:
                     message = str(error).lower()
                     oom = (
@@ -309,6 +345,7 @@ class MinSR(TDVP):
                     current = min(self._jacobian_batch or samples.nsamples, samples.nsamples)
                     if not oom or current <= 1:
                         raise
+                del Tmat
                 self._jacobian_batch = _retry_batch(current, message, devices)
                 self._logger.warning(
                     f"MinSR GPU out of memory. Retrying with derivative sample batch={self._jacobian_batch:d} "
@@ -319,7 +356,9 @@ class MinSR(TDVP):
             raise
 
     def _step_from_energy(self, samples: Samples, Ebar: jax.Array) -> jax.Array:
-        Tmat = self.get_Tmat(samples)
+        return self._finish_step(samples, self.get_Tmat(samples), Ebar)
+
+    def _finish_step(self, samples: Samples, Tmat: jax.Array, Ebar: jax.Array) -> jax.Array:
         step = self.solve(samples, Tmat, Ebar)
         step = self.build_step(step, self._Omean, self._energy)
         return step

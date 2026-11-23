@@ -59,7 +59,7 @@ $$
 T=\bar O\bar O^\dagger,\qquad \delta\theta=\bar O^\dagger T^+\bar\epsilon.
 $$
 
-这里的 $T^+$ 表示伪逆形式的求解；实现通过特征值分解和对小特征值的平滑抑制控制数值不稳定。实际调用 `state.update(eta * step)` 后，网络参数沿 $-\eta\delta\theta$ 更新，另外还处理整体尺度项。
+这里的 $T^+$ 表示伪逆形式的求解。实值训练示例默认用 FP32 保存网络参数，以 FP64 构造样本空间矩阵并做特征值分解。默认伪逆采用论文式 (23) 的软截断，FP64 下相对阈值为 $10^{-12}$，绝对阈值为 0。调用 `state.update(eta * step)` 后，网络参数沿 $-\eta\delta\theta$ 更新，同时调整波函数的整体尺度。[伪逆实现](../quantax/optimizer/solver.py) · [论文 Methods](Chen-2024-MinSR/paper.pdf#page=8)
 
 这样，主要的矩阵求解从参数数决定的维度转到样本数决定的维度。当 $N_p\gg N_s$ 时，这一转换适合深网络。它仍需构造样本空间矩阵，样本数增大时也会增加内存和求解开销，不能仅靠增加样本数消除训练成本。
 
@@ -81,7 +81,11 @@ $$
 
 教程 1 使用全连接受限玻尔兹曼机 `RBM_Dense`，其余教程使用残差卷积网络 `ResSum`。`ResSum(depth, channels, kernel_size)` 的前三个参数分别指定卷积层数、通道数和卷积核大小，`depth` 必须是偶数。卷积采用周期填充，末端通过空间求和或带平移特征标的求和生成波函数振幅。
 
-默认实数设置下，`ResSum` 的指数输出给出正振幅。`use_sinh=True` 将末端激活改为带整体尺度的 $\sinh(x)+1$，使实输出可以变号。三角格教程则将默认计算类型设为复数，网络把实通道配成复数后输出复振幅；网络参数仍为实数。实现见 [sum_nets.py](../quantax/nn/sum_nets.py) 和 [activation.py](../quantax/nn/activation.py)。
+对 10×10 方格的实值 `ResSum`，末层逐项激活后取平均。`use_sinh=False` 使用 $\exp(x+\theta_0)$，在当前对称性配置下输出正振幅。`use_sinh=True` 改用 $\exp(\theta_0)(\sinh(x)+1)$，允许不同构型的振幅取正或取负。这里 $\theta_0$ 控制整体尺度，加 1 让 $x=0$ 时的激活保持为正。[网络实现](../quantax/nn/sum_nets.py) · [激活函数](../quantax/nn/activation.py)
+
+`msr=True` 在哈密顿量中实现 Marshall 基底变换，翻转第一近邻的横向交换项，保留第二近邻项的符号。对 $J_2/J_1=0.5$ 的受挫方格，Marshall 规则给出近似的符号结构。启用 `use_sinh=True` 后，网络可以在这个基底里学习哪些构型需要翻号。[Heisenberg 实现](../quantax/operator/common_operators.py) · [论文的网络结构与符号说明](Chen-2024-MinSR/paper.pdf#page=8)
+
+三角格教程使用复振幅。网络把实通道配成复数后使用指数激活，网络参数仍为实数。[网络实现](../quantax/nn/sum_nets.py)
 
 ### 对称性约束
 
@@ -130,7 +134,7 @@ environments/py311-jax062/.venv/bin/python -m examples.run_pipeline
 
 三个阶段脚本单独运行时，都可用命令行临时覆盖各自的配置参数，未指定的参数沿用 [`run_pipeline.py`](../examples/run_pipeline.py) 中的默认值。例如用对应的 JAX 解释器运行 `python -m examples.train --STEPS 1000 --NSAMPLES 2000 --step-size 0.001`。参数名支持大写下划线或小写连字符两种写法，如 `--MAX_PARALLEL` 和 `--max-parallel`。`--use-sinh` 接受 `true` 或 `false`。各脚本的参数列表见 `--help`。
 
-普通训练和对称性训练可用 `--jacobian-batch 1000` 从每批 1000 个样本开始计算导数。对应的流水线配置为 `JACOBIAN_BATCH=1000`，直接调用 MinSR 时使用 `jacobian_batch=1000`。默认 `None` 先整批计算导数。单进程 GPU 训练在局域能量计算完成后遇到 MinSR 显存分配错误时，用原样本重试。若失败的申请量超过分配器当前余量，就按两者的比例缩小批大小，并预留 20% 的余量。无法据此估算时将批大小减半。每次调整都会记入日志，后续训练步沿用成功的批大小。 [流水线配置](../examples/run_pipeline.py) · [MinSR 实现](../quantax/optimizer/minsr.py)
+普通训练和对称性训练可用 `--jacobian-batch 1000` 将导数批量的初始上限设为 1000 个样本。对应的流水线配置为 `JACOBIAN_BATCH=1000`，直接调用 MinSR 时使用 `jacobian_batch=1000`。默认值为 `None`，单 GPU 对称性训练按显存余量估算初始批量，普通训练先用整批样本。遇到可重试的显存分配失败时，MinSR 用原样本缩批重试。每次调整都会记入日志，后续训练步沿用成功的批量。初始 Gram 矩阵的尺寸由总样本数决定，分配失败时直接报错。[流水线配置](../examples/run_pipeline.py) · [MinSR 实现](../quantax/optimizer/minsr.py)
 
 减小导数批量会增加分批次数，可能增加内核调度开销并降低 GPU 利用率。JAX 切换批大小时通常要重新编译，浮点运算也可能产生小幅差异。中心化、Gram 矩阵和求解仍使用全部样本，因此样本数和估计量保持不变。
 
@@ -158,11 +162,25 @@ environments/py311-jax062/.venv/bin/python -m examples.run_pipeline
 
 ## 数值约定与运行限制
 
-论文图 2b 与复现结果的对比见[复现记录](reproduction-results.md)，其中汇总了两个训练阶段和测量结果，并列给出每格点能量 $E_{\mathrm{spin}}/N$ 和总能量 $E_{\mathrm{Pauli}}$。
+### 能量与方差换算
 
-`Heisenberg` 使用 Pauli 矩阵归一化，未启用 `msr` 时每条键对应 $J_{ij}\boldsymbol{\sigma}_i\cdot\boldsymbol{\sigma}_j$。对于通常的自旋算符 $\boldsymbol S=\boldsymbol\sigma/2$，相同耦合常数下能量相差 4 倍。`msr=True` 在第一近邻键上改变横向交换项的符号，纵向项和第二近邻项保持原样。比较教程、脚本与论文表格时，需要核对这一基底约定、能量尺度以及总能量和每格点能量的区别。源码见 [common_operators.py](../quantax/operator/common_operators.py)。
+论文式 (4) 用自旋算符 $\mathbf S$，仓库的 `Heisenberg` 用 Pauli 矩阵 $\boldsymbol\sigma$。对自旋 1/2，$\mathbf S_i=\boldsymbol\sigma_i/2$，因此每条键上的 $\mathbf S_i\cdot\mathbf S_j$ 等于 $\boldsymbol\sigma_i\cdot\boldsymbol\sigma_j/4$。相同耦合常数下，Pauli 总能量是自旋算符总能量的 4 倍，方差是 16 倍。记 $N$ 为格点数，论文每格点值与日志总量的换算为
+
+$$
+\frac{E_{\mathrm{spin}}}{N}=\frac{E_{\mathrm{Pauli}}}{4N},
+\qquad
+\frac{\sigma^2_{\mathrm{spin}}}{N}=\frac{\sigma^2_{\mathrm{Pauli}}}{16N}.
+$$
+
+核对训练日志的 `E` 或测量摘要的 `energy` 时用 Pauli 总能量。测量摘要的 `energy_per_site` 已除以格点数，再除以 4 即得论文口径的每格点能量。[Heisenberg 实现](../quantax/operator/common_operators.py) · [测量摘要示例](../runs/j1j2_square_10x10_J1-1_J2-0.5/20261119_150209/summary.json) · [论文与复现结果](reproduction-results.md#论文结果和模型配置)
 
 `optimizer.VarE` 是局域能量的中心二阶矩估计。`H.expectation(state, samples, return_var=True)` 的第二个返回值在当前实现中是 $\langle|E_{\mathrm{loc}}|^2\rangle$，尚未减去均值平方；[`measure.py`](../examples/measure.py) 因此在汇总后另算方差。它们都不等同于能量均值的统计误差。
+
+### 零方差外推
+
+哈密顿量本征态的能量方差 $\sigma^2=\langle H^2\rangle-\langle H\rangle^2$ 为零。若几组变分态都接近同一个目标本征态，且误差成分的组成相近，能量偏差近似正比于方差。论文用 $\sigma^2/N$ 作横轴、$E/N$ 作纵轴拟合直线，零方差处的截距给出目标对称性下最低能量的估计。一步 Lanczos 在变分态及哈密顿量作用于该态所得向量张成的子空间里重新最小化能量，可以提供一个额外的拟合点。[论文式 (30)–(34)](Chen-2024-MinSR/paper.pdf#page=9) · [10×10 方格的拟合示例](reproduction-results.md#零方差拟合数据)
+
+### 运行限制
 
 晶格和部分对称性对象依赖全局状态并带有缓存。切换到另一教程、另一晶格尺寸或另一数值类型配置时，重启 Notebook 内核再执行。`max_parallel` 限制每台设备的前向批量，对称投影会占用该批量；它不直接限制所有导数和求解矩阵的内存。降低它可以缓解部分内存压力，样本数和网络规模也需配合调整。
 

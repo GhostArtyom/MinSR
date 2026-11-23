@@ -29,6 +29,7 @@ MinSR is the reproduction repository for *Empowering deep neural quantum states 
 
 ## Run directories and Git
 
+- Write each commit message as a single concise sentence on one line. Omit the body.
 - JAX writes to `runs/<system>/<timestamp>/` by default, and PyTorch writes to `runs/torch/<system>/<timestamp>/`. Use `runs/<system>/<timestamp>/` for shared archives. Put any pipeline console log and PID file in the first stage's run directory. Use separate temporary directories only for debugging or smoke tests.
 - When starting a run that writes logs, tell the user the log location as soon as it is available. For pipelines, share the console log and report each stage's log when it starts.
 - Keep `runs/` ignored by default. When asked to commit results from completed runs, force-add the final checkpoint from each selected training stage in its native format (`.eqx` for JAX, `.pt` for PyTorch), the stage log, and the PDF plots. For completed measurements, include `measurement.log`, `measurement.csv`, `summary.json`, and any PDFs. The input checkpoint belongs in its training archive.
