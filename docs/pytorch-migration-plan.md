@@ -28,7 +28,7 @@
 | 对称性训练 | 1000 步 | `TotalSz(0) + SpinInverse() + C4v()` | 1.0 | 2000 / 200 | 0.001 |
 | 测量 | 100 轮 | `TotalSz(0) + SpinInverse() + C4v()` | 2.0 | 10000 / 1000 | — |
 
-普通训练默认随机初始化。传入 `--initial-weights` 可从指定的 `.eqx` 或 `.pt` 权重起跑，执行全部阶段。已有普通训练最终权重时，用 `FROM_CHECKPOINT` 或 `--from-checkpoint` 直接开始对称性训练。单独运行对称性训练或测量时，用 `examples_torch.train_symm --param-file` 或 `examples_torch.measure --param-file`。测量也可用 `--network-idx` 选择内置网络预设。[对称性训练入口](../examples_torch/train_symm.py) · [测量入口](../examples_torch/measure.py)
+普通训练默认随机初始化。使用 CUDA 时，卷积权重直接在 GPU 上生成，初始化和采样各自使用以 `--seed` 设置的生成器。使用 CPU 时，权重在 CPU 上生成。传入 `--initial-weights` 可从指定的 `.eqx` 或 `.pt` 权重起跑，执行全部阶段。已有普通训练最终权重时，用 `FROM_CHECKPOINT` 或 `--from-checkpoint` 直接开始对称性训练。单独运行对称性训练或测量时，用 `examples_torch.train_symm --param-file` 或 `examples_torch.measure --param-file`。测量也可用 `--network-idx` 选择内置网络预设。[对称性训练入口](../examples_torch/train_symm.py) · [测量入口](../examples_torch/measure.py)
 
 普通训练和对称性训练沿用原版 MinSR 的中心化、伪逆和固定步长。训练遇到非有限值或求解失败时停止。
 

@@ -58,7 +58,7 @@ class Linear(nn.Linear):
 class Conv(nn.Module):
     def __init__(self, num_spatial_dims, in_channels, out_channels, kernel_size,
                  stride=1, padding="CIRCULAR", dilation=1, groups=1, use_bias=True,
-                 kernel_init=lecun_normal, bias_init=nn.init.zeros_, *, key=None):
+                 kernel_init=lecun_normal, bias_init=nn.init.zeros_, *, key=None, device=None):
         super().__init__()
         dims = num_spatial_dims
         if dims not in (1, 2, 3) or in_channels % groups or out_channels % groups:
@@ -69,8 +69,9 @@ class Conv(nn.Module):
         self.groups = groups
         self.conv = (F.conv1d, F.conv2d, F.conv3d)[dims - 1]
         dtype = get_params_dtype()
-        self.weight = nn.Parameter(torch.empty(out_channels, in_channels // groups, *self.kernel_size, dtype=dtype))
-        self.bias = nn.Parameter(torch.empty(out_channels, dtype=dtype)) if use_bias else None
+        weight_shape = (out_channels, in_channels // groups, *self.kernel_size)
+        self.weight = nn.Parameter(torch.empty(weight_shape, dtype=dtype, device=device))
+        self.bias = nn.Parameter(torch.empty(out_channels, dtype=dtype, device=device)) if use_bias else None
         kernel_init(self.weight, key)
         if self.bias is not None:
             bias_init(self.bias)

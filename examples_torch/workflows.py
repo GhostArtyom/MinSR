@@ -68,7 +68,12 @@ def _system(config, symmetric, checkpoint=None):
     symm = qtx.symmetry.TotalSz()
     if symmetric:
         symm += qtx.symmetry.SpinInverse() + qtx.symmetry.C4v()
-    net = qtx.nn.ResSum(**config.network)
+    if device.type == "cuda" and checkpoint is None:
+        # Keep initialization draws from advancing the sampler's generator.
+        generator = torch.Generator(device=device).manual_seed(config.seed)
+        net = qtx.nn.ResSum(**config.network, device=device, generator=generator)
+    else:
+        net = qtx.nn.ResSum(**config.network)
     if device.type == "cuda" and not symmetric:
         net.to(memory_format=torch.channels_last)
     if symmetric and device.type == "cuda":
@@ -118,6 +123,10 @@ def _header(logger, config, state, steps, thermal, sweep, symmetric, reweight, c
     logger.info(f"PyTorch {torch.__version__} | seed={config.seed:d}")
     if checkpoint is not None:
         logger.info(f"Input weights: {checkpoint}")
+    elif state.device.type == "cuda":
+        logger.info(f"Initial weights: generated on {state.device}")
+    else:
+        logger.info("Initial weights: generated on CPU")
     log_devices(logger, [state.device])
 
 
