@@ -1,0 +1,28 @@
+{
+  "system": "j1j2_square_10x10_J1-1_J2-0.5",
+  "network_idx": null,
+  "network": {
+    "depth": 16,
+    "channels": 16,
+    "kernel_size": 3,
+    "use_sinh": true
+  },
+  "param_file": "/home/ghost/Code/MinSR/runs/j1j2_square_10x10_J1-1_J2-0.5/20261124_214400/params_symm_1000.pt",
+  "symmetry": "TotalSz(0) + SpinInverse() + C4v()",
+  "nsamples": 1000,
+  "steps": 100,
+  "max_parallel": 32768,
+  "inference_batch": 1024,
+  "local_energy_batch": 4096,
+  "projected_periodic_conv": true,
+  "projected_exchange_graph": true,
+  "projected_local_energy_graph": true,
+  "thermal_steps": 10000,
+  "sweep_steps": 1000,
+  "energy": -198.79906049668713,
+  "energy_per_site": -1.9879906049668714,
+  "variance": 4.9492110681167105,
+  "seconds": 2165.6692352039972,
+  "seed": 2347,
+  "device": "cuda"
+}

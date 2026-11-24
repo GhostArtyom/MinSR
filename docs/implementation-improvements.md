@@ -13,7 +13,7 @@ PyTorch 优化沿用原版的 Heisenberg 算符、Metropolis 采样和 MinSR 更
 | RTX 4070 Ti | JAX | 1.44 | 18.47 | 49.44 | 7.5 小时 |
 | RTX 4070 Ti | PyTorch | 0.79 | 8.07 | 13.95 | 3.1 小时 |
 | RTX 5060 Ti | JAX | 2.44 | 30.20 | 83.28 | 12.4 小时 |
-| RTX 5060 Ti | PyTorch | 1.00 | 9.46 | 21.09 | 3.8 小时 |
+| RTX 5060 Ti | PyTorch | 0.93 | 8.72 | 20.14 | 3.6 小时 |
 
 ## PyTorch 实现优化
 
