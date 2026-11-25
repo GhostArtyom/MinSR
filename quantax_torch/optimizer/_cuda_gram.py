@@ -74,26 +74,37 @@ def mirror_gram_(out, tile, lower_only):
         out[:start, start:end].copy_(out[start:end, :start].mT)
 
 
-def tune_gram(out, block, tile):
-    """Time each backend with the existing output buffer, before its first accumulation."""
+def time_gram_backends(out, block, tile, *, warmup=0, steps=1):
+    """Return CUDA timings in milliseconds before the first accumulation."""
     timings = {}
     start, stop = (torch.cuda.Event(enable_timing=True) for _ in range(2))
     for backend in ("full GEMM", "tiled GEMM", "cuBLAS SYRK"):
-        out.zero_()
-        start.record()
-        if backend == "full GEMM":
-            out.addmm_(block, block.mT)
-        elif backend == "tiled GEMM":
-            add_gram_tiled_(out, block, tile)
-            mirror_gram_(out, tile, False)
-        else:
-            if not add_gram_lower_(out, block):
-                continue
-            mirror_gram_(out, tile, True)
-        stop.record()
-        stop.synchronize()
-        timings[backend] = start.elapsed_time(stop)
+        samples = []
+        for iteration in range(warmup + steps):
+            out.zero_()
+            start.record()
+            if backend == "full GEMM":
+                out.addmm_(block, block.mT)
+            elif backend == "tiled GEMM":
+                add_gram_tiled_(out, block, tile)
+                mirror_gram_(out, tile, False)
+            else:
+                if not add_gram_lower_(out, block):
+                    break
+                mirror_gram_(out, tile, True)
+            stop.record()
+            stop.synchronize()
+            if iteration >= warmup:
+                samples.append(start.elapsed_time(stop))
+        if samples:
+            timings[backend] = samples
     out.zero_()
+    return timings
+
+
+def tune_gram(out, block, tile):
+    """Time each backend with the existing output buffer, before its first accumulation."""
+    timings = {name: samples[0] for name, samples in time_gram_backends(out, block, tile).items()}
     best = min(timings, key=timings.get)
     if timings[best] >= 0.95 * timings["full GEMM"]:
         return "full GEMM"

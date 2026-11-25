@@ -1,4 +1,4 @@
-"""Time synchronized PyTorch training steps for one configuration per process."""
+"""Time synchronized PyTorch training steps or compare CUDA batch combinations."""
 
 import argparse
 import json
@@ -18,17 +18,38 @@ def main():
     add_common_options(parser)
     add_sampling_options(parser)
     parser.add_argument("--symmetric", action="store_true")
+    parser.add_argument("--matrix", action="store_true", help="Compare batch combinations for all three CUDA stages.")
+    parser.add_argument("--save-tuning", action="store_true", help="Save verified matrix winners to the CUDA cache.")
     parser.add_argument("--param-file", type=Path)
     parser.add_argument("--steps", type=int, default=5, help="Measured training steps (after warmup).")
     parser.add_argument("--warmup", type=int, default=2, help="Training steps excluded from the medians.")
     args = vars(parser.parse_args())
-    symmetric, param_file, steps, warmup, thermal, sweep = (
-        args.pop(k) for k in ("symmetric", "param_file", "steps", "warmup", "thermal_steps", "sweep_steps")
+    symmetric, matrix, save_tuning, param_file, steps, warmup, thermal, sweep = (
+        args.pop(k) for k in ("symmetric", "matrix", "save_tuning", "param_file", "steps", "warmup",
+                              "thermal_steps", "sweep_steps")
     )
     if steps < 1 or warmup < 1:
         parser.error("--steps and --warmup must be positive")
     config = Config(**args)
+    if matrix:
+        if (torch.device(config.device).type != "cuda" or torch.version.cuda is None
+                or not torch.cuda.is_available()):
+            parser.error("--matrix requires an NVIDIA CUDA device")
+        if symmetric or any(value is not None for value in (
+            config.jacobian_batch, config.projected_forward_batch, config.local_energy_forward_batch,
+            config.eigh_backend,
+        )):
+            parser.error("--matrix sets the stages, batch sizes and eigensolver itself")
+        from ._benchmark_torch_matrix import run_matrix
+
+        return run_matrix(config, param_file, thermal, sweep, warmup, steps, save_tuning)
+    if save_tuning:
+        parser.error("--save-tuning requires --matrix")
+    from scripts._benchmark_cuda_memory import finish_cuda_step, start_cuda_step
+
     thermal, sweep = config.sampling(thermal, sweep)
+    if torch.device(config.device).type == "cuda" and config.eigh_backend is not None:
+        torch.backends.cuda.preferred_linalg_library(config.eigh_backend)
     hamiltonian, state = workflows._system(config, symmetric, param_file)
     sync = (lambda: torch.cuda.synchronize(state.device)) if state.device.type == "cuda" else (lambda: None)
 
@@ -39,7 +60,7 @@ def main():
         sync()
         return perf_counter() - start, out
 
-    setup, sampler = timed(workflows._sampler, config, state, 1.0, thermal, sweep)
+    setup, sampler = timed(workflows._sampler, config, state, 1.0, thermal, sweep, None)
     opt = qtx.optimizer.MinSR(state, hamiltonian, jacobian_batch=config.jacobian_batch)
     get_ebar = opt.get_Ebar
     eloc_seconds = 0.0
@@ -55,25 +76,35 @@ def main():
                           device=torch.cuda.get_device_name(state.device) if state.device.type == "cuda" else "cpu"),
                      default=str), flush=True)
     rows = []
-    if state.device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(state.device)
+    memory_rows = []
+    cuda = state.device.type == "cuda"
     for i in range(warmup + steps):
+        memory = start_cuda_step(state.device) if cuda else None
         sampling, samples = timed(sampler.sweep)
         optimize, update = timed(opt.get_step, samples)
         if not update.isfinite().all():
             raise FloatingPointError(f"Nonfinite update at step {i + 1}")
         apply, _ = timed(state.update, update * config.step_size)
         row = dict(step=i + 1, warmup=i < warmup, sampling=sampling, local_energy=eloc_seconds,
-                   minsr=optimize - eloc_seconds + apply, total=sampling + optimize + apply,
+                   minsr=optimize - eloc_seconds, update=apply, total=sampling + optimize + apply,
                    energy=opt.energy.item(), variance=opt.VarE.item())
+        if memory is not None:
+            row["cuda_memory"] = finish_cuda_step(state.device, memory)
+            row["jacobian_batch"] = opt._last_jacobian_batch
+            local_batch = hamiltonian._local_energy_batch
+            row["local_energy_forward_batch"] = None if local_batch is None else local_batch * state.nsymm
+            row["derivative_cache"] = opt._last_cache_plan
+            memory_rows.append(memory)
         if i >= warmup:
             rows.append(row)
         print(json.dumps(row, allow_nan=False), flush=True)
-    print(json.dumps(dict(medians={k: median(row[k] for row in rows)
-                                   for k in ("sampling", "local_energy", "minsr", "total")},
-                          peak_mib=torch.cuda.max_memory_allocated(state.device) / 2**20
-                          if state.device.type == "cuda" else None)), flush=True)
+    summary = {
+        "medians": {k: median(row[k] for row in rows) for k in ("sampling", "local_energy", "minsr", "update", "total")},
+        "peak_mib": max((row["allocated_peak_bytes"] / 2**20 for row in memory_rows), default=None),
+        "peak_reserved_mib": max((row["reserved_peak_bytes"] / 2**20 for row in memory_rows), default=None),
+    }
+    print(json.dumps(summary), flush=True)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -91,7 +91,7 @@ def thermalization_progress(logger, start_time):
         nonlocal previous_time
         end = perf_counter()
         seconds = end - previous_time if step else 0.0
-        logger.info(f"Thermalization {step:d}/{total:d}, {seconds:.2f}, {end - start_time:.2f}")
+        logger.info(f"Thermalization, {step:d}/{total:d}, {seconds:.2f}, {end - start_time:.2f}")
         previous_time = end
 
     return report

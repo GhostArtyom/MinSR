@@ -19,7 +19,7 @@ PyTorch 优化沿用原版的 Heisenberg 算符、Metropolis 采样和 MinSR 更
 
 | 环节 | 改动 |
 | --- | --- |
-| [交换采样](../quantax_torch/sampler/metropolis.py) | 用 CUDA Graph 重放交换提议。对称性采样在 GPU 上筛出异向自旋的提议，跳过同向交换的波函数求值。采样链超出单图容量时分组复用图，保留原随机数生成顺序。 |
+| [交换采样](../quantax_torch/sampler/metropolis.py) | 用 CUDA Graph 重放交换提议。支持的普通训练、对称性训练和测量在热化及采样时都在 GPU 上筛出异向自旋的提议，跳过同向交换的波函数求值。采样链超出单图容量时分组复用图，保留原随机数生成顺序。 |
 | [局域能量](../quantax_torch/operator/common_operators.py) | 在设备上分块筛选有效交换，分批求波函数并累加。对称性路径按设备计时选择前向批量，复用整批的 CUDA Graph 和缓冲区，余下交换走即时计算。 |
 | [卷积前向](../quantax_torch/nn/_periodic_cuda.py) | 普通训练采用 `channels_last` 存储布局。专用内核用 IEEE FP32 直接按周期坐标取值，省去显式填充，并在支持的层合并激活、残差加法或末端归约。 |
 | [卷积反向](../quantax_torch/optimizer/_res_sum.py) | 对支持的 ResSum 块批量计算逐样本导数。普通训练按设备实测选择周期卷积反向或 `unfold`，对称性专用反向直接归约同一样本的轨道成员。 |
@@ -31,7 +31,7 @@ PyTorch 优化沿用原版的 Heisenberg 算符、Metropolis 采样和 MinSR 更
 
 `nsamples` 是采样链数。`max_parallel` 限制单次前向的输入数，按展开后的对称轨道成员计数。设置 `projected_forward_batch` 可在该上限内固定对称性前向批量。`jacobian_batch` 按求导的样本构型计数，中心化、Gram 矩阵和求解都使用全部样本。
 
-PyTorch 在未指定 `jacobian_batch` 时，将 GPU 空闲显存和分配器中可复用的缓存计入预算，按进程的显存上限截断。扣除导数输出、FP64 中心化临时量和设备总显存的 10% 后，再按网络和对称轨道估算每批可处理的构型数。单进程 CUDA 更新遇到显存不足时，先释放分配器中未使用的缓存，再缩减导数缓存或批量，用原样本重试。 [PyTorch MinSR 实现](../quantax_torch/optimizer/minsr.py)
+直接调用 PyTorch MinSR 且未指定 `jacobian_batch` 时，先用 GPU 空闲显存和分配器可复用缓存估算预算，再按进程上限截断，并预留设备总显存的 10%。整批求导逐参数块产出导数，按同时存在的激活、当前块的工作区和可能累积的导数缓存估算。拆批还要在求导时为全部样本组装原生精度的导数，再按状态精度为中心化预留空间。整批预算不足时，按拆批模型选择起试值。有至少两个样本时，底层估算的起试下限为每批两个。PyTorch CUDA 训练示例还会参考相近配置，并用首个正式更新验证批量。单进程 CUDA 更新遇到显存不足时，先释放分配器中未使用的缓存，再缩减导数缓存或批量，用原样本重试，批量可降至一个样本。 [PyTorch MinSR 实现](../quantax_torch/optimizer/minsr.py) · [训练示例的批量选择](pytorch-migration-plan.md)
 
 ## JAX：设备端局域能量
 

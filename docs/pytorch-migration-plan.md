@@ -32,7 +32,24 @@
 
 普通训练和对称性训练沿用原版 MinSR 的中心化、伪逆和固定步长。训练遇到非有限值或求解失败时停止。
 
-JAX 和 PyTorch MinSR 均用 `jacobian_batch` 设置每批求导的样本数，命令行参数为 `--jacobian-batch`。PyTorch 在 CUDA 上默认按当前可用显存和每样本临时开销估算批量，最多取总样本数。首步日志用 `samples/batch` 记录实际导数批量。前向用 `inputs`，采样图分组用 `chains/group`，对称性局域能量用 `orbit members/batch`。
+JAX 和 PyTorch MinSR 均用 `jacobian_batch` 设置每批求导的样本数，命令行参数为 `--jacobian-batch`。PyTorch CUDA 示例优先读取完全匹配的记录。没有匹配记录时，从相同 GPU 型号、执行路径和训练阶段的相近配置取起点，较大的网络会下调候选值。没有相近记录时，按当前显存估算。估算偏低时，训练示例从最多 32 个样本起试，受总样本数和单批前向可容纳的样本数限制。首步用热化后的实际样本验证批量，其更新直接用于训练。首步日志用 `samples/batch` 记录实际导数批量。前向用 `inputs`，采样图分组用 `chains/group`，对称性局域能量用 `orbit members/batch`。
+
+普通训练、对称性训练和测量分别保存记录。记录按 GPU、PyTorch/CUDA 版本、网络、体系、样本数和后端配置匹配。训练记录包含验证通过的雅可比批量，以及已选出的 Gram 后端和局域能量前向批量。显存不足时用原样本回退，既有批量记录继续用于后续运行。普通训练默认比较每批 512、1024 和 2048 个连接构型，受 `max_parallel` 限制。对称性训练和测量在未显式指定 `projected_forward_batch` 且支持 CUDA Graph 时，也用热化后的样本选前向批量。文件默认保存在 `~/.cache/minsr/torch-cuda-tuning/`，设置 `XDG_CACHE_HOME` 后以该目录为根。日志记录使用的 JSON 路径，删除该文件可重新验证批量。 [CUDA 调优实现](../examples_torch/_cuda_tuning.py)
+
+可以先用独立入口为指定网络和样本数生成记录。任选 `train`、`train_symm` 或 `measure`，每次按该阶段的配置热化并取一批样本，权重固定。以下用仓库附带的权重为测量阶段提前调优。省略 `--param-file` 时在 CUDA 上随机初始化，也可以传入自己的检查点。
+
+```bash
+.venv/bin/python -m examples_torch.tune_cuda measure --depth 30 --channels 64 --nsamples 1000 \
+  --param-file params/square10x10_3064.eqx
+```
+
+需要比较雅可比和局域能量批量的组合时，用独立的 [CUDA 矩阵基准](../scripts/benchmark_torch_training.py)。默认每组使用固定样本预热 2 次、计时 5 次，再将每阶段最快的两组各用 2 步/轮预热和 10 步/轮计时做完整复测。结果写入 `runs/torch/<system>/<timestamp>/` 下的 `benchmark.log` 和 `summary.json`。加上 `--save-tuning` 时，复测通过的胜者写入自动调优缓存。
+
+```bash
+.venv/bin/python -m scripts.benchmark_torch_training --matrix --depth 30 --channels 64 --nsamples 1000 --save-tuning
+```
+
+已有候选时，可以按 [批量实测与选择](pytorch-cuda-benchmark.md) 交替短测，记录逐步的分配峰值、预留峰值和驱动空闲量。WSL 下也可同时采样 Windows 的专用及共享 GPU 内存。
 
 单进程 CUDA MinSR 更新遇到显存分配错误时，用原样本缩减导数缓存或批量后重试。中心化、Gram 矩阵和求解始终使用全部样本。 [MinSR 实现](../quantax_torch/optimizer/minsr.py)
 
@@ -47,6 +64,7 @@ JAX 和 PyTorch MinSR 均用 `jacobian_batch` 设置每批求导的样本数，�
 | 配置 | 用途 |
 | --- | --- |
 | `projected_forward_batch` | 按展开后的对称轨道成员固定对称性前向批量，同时受 `max_parallel` 限制。默认采样用 1024，局域能量按设备实测选择 1024、2048 或 4096。 |
+| `local_energy_forward_batch` | 单独固定局域能量的前向批量，按轨道成员计数，须容纳整数个轨道且至多为 `max_parallel`。同时设置 `projected_forward_batch` 时，采样使用自己的批量。 |
 | `projected_periodic_conv` / `ordinary_periodic_conv` | 分别控制对称阶段和普通训练的专用周期卷积前向。 |
 | `projected_local_energy_graph` | 对称阶段的局域能量整批前向重放。 |
 | `projected_exchange_graph` | 对称阶段的压缩交换提议重放。 |

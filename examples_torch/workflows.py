@@ -10,10 +10,12 @@ import torch
 
 import quantax_torch as qtx
 from quantax_torch.nn._cuda_support import periodic_cuda_issue
+from quantax_torch.sampler.metropolis import _counted_exchange_forward
 from quantax_torch.utils import (
     DataTracer, close_run, create_run, log_devices, log_progress, save_training_plots, setup_plot_font,
 )
 from quantax_torch.utils.logger import thermalization_progress
+from ._cuda_tuning import first_cuda_measurement, first_cuda_step
 
 
 def _periodic_forward_issue(config, device, symmetric):
@@ -48,6 +50,18 @@ def _local_energy_graph_issue(config, inference):
     return None
 
 
+def _hamiltonian(config, device, symmetric, inference):
+    local_energy_graph = symmetric and _local_energy_graph_issue(config, inference) is None
+    return qtx.operator.Heisenberg(
+        J=[config.J1, config.J2], n_neighbor=[1, 2], msr=True,
+        local_energy_graph=local_energy_graph,
+        reuse_local_energy_pool=local_energy_graph,
+        tune_local_energy=(not symmetric and device.type == "cuda")
+        or (local_energy_graph and config.projected_forward_batch is None),
+        local_energy_forward_batch=config.local_energy_forward_batch,
+    )
+
+
 def _system(config, symmetric, checkpoint=None):
     device = torch.device(config.device)
     if device.type == "cuda":
@@ -58,16 +72,12 @@ def _system(config, symmetric, checkpoint=None):
     qtx.set_random_seed(config.seed)
     qtx.sites.Square(config.L)
     inference = _cuda_inference(config, device, symmetric)
-    local_energy_graph = symmetric and _local_energy_graph_issue(config, inference) is None
-    hamiltonian = qtx.operator.Heisenberg(
-        J=[config.J1, config.J2], n_neighbor=[1, 2], msr=True,
-        local_energy_graph=local_energy_graph,
-        reuse_local_energy_pool=local_energy_graph,
-        tune_local_energy=local_energy_graph and config.projected_forward_batch is None,
-    )
+    hamiltonian = _hamiltonian(config, device, symmetric, inference)
     symm = qtx.symmetry.TotalSz()
     if symmetric:
         symm += qtx.symmetry.SpinInverse() + qtx.symmetry.C4v()
+    if config.local_energy_forward_batch is not None and config.local_energy_forward_batch % symm.nsymm:
+        raise ValueError(f"local_energy_forward_batch must be a multiple of the orbit size {symm.nsymm}.")
     if device.type == "cuda" and checkpoint is None:
         # Keep initialization draws from advancing the sampler's generator.
         generator = torch.Generator(device=device).manual_seed(config.seed)
@@ -131,10 +141,11 @@ def _header(logger, config, state, steps, thermal, sweep, symmetric, reweight, c
 
 
 def _sampler(config, state, reweight, thermal, sweep, thermal_progress):
+    compact = state.device.type == "cuda" and (state.nsymm > 1 or _counted_exchange_forward(state) is not None)
     return qtx.sampler.NeighborExchange(
         state, config.nsamples, reweight=reweight, n_neighbor=[1, 2], thermal_steps=thermal, sweep_steps=sweep,
         cuda_graph=state.nsymm == 1 or config.projected_exchange_graph,
-        skip_unchanged=state.device.type == "cuda" and state.nsymm > 1,
+        skip_unchanged=compact,
         thermal_progress=thermal_progress,
     )
 
@@ -164,7 +175,11 @@ def _log_cuda_paths(logger, config, state, sampler, hamiltonian, optimizer=None)
         else:
             reason = _local_energy_graph_issue(config, state.inference_fn)
             detail = f" ({reason})" if reason is not None else ""
-            logger.info(f"CUDA local energy: eager{detail}")
+            batch = config.local_energy_forward_batch
+            size = f" | {batch} orbit members/batch" if batch is not None else ""
+            logger.info(f"CUDA local energy: eager{detail}{size}")
+    elif (batch := getattr(hamiltonian, "_local_energy_batch", None)) is not None:
+        logger.info(f"CUDA local energy: eager | {batch} inputs/batch")
     if optimizer is not None:
         optimizer.log_backends(logger)
 
@@ -200,10 +215,14 @@ def train(config, *, steps, param_file=None, symmetric=False, thermal_steps=None
         baseline = -199.0859 if (config.L, config.J1, config.J2) == (10, 1.0, 0.5) else None
         if symmetric:
             title += " (symm)"
+        tune = state.device.type == "cuda" and torch.version.cuda is not None
         for n in range(1, steps + 1):
             step_start = perf_counter()
             samples = sampler.sweep()
-            update = optimizer.get_step(samples)
+            if tune and n == 1:
+                update = first_cuda_step(config, optimizer, samples, symmetric, logger)
+            else:
+                update = optimizer.get_step(samples)
             if not bool(update.isfinite().all()):
                 raise FloatingPointError(f"Non-finite update at step {n}.")
             state.update(update * config.step_size)
@@ -244,6 +263,7 @@ def measure(config, *, steps, param_file, preset=None, thermal_steps=None, sweep
         hamiltonian, state = _system(config, True, checkpoint)
         _header(logger, config, state, steps, thermal, sweep, True, 2.0, checkpoint)
         sampler = _sampler(config, state, 2.0, thermal, sweep, thermalization_progress(logger, start))
+        tune = getattr(hamiltonian, "_tune_local_energy", False)
         fields = ["step", "energy", "second_moment", "mean_energy", "mean_variance", "step_seconds", "elapsed_seconds"]
         sum_energy = 0.0
         sum_second = 0.0
@@ -253,7 +273,11 @@ def measure(config, *, steps, param_file, preset=None, thermal_steps=None, sweep
             stream.flush()
             for i in range(1, steps + 1):
                 step_start = perf_counter()
-                energy, second = hamiltonian.expectation(state, sampler.sweep(), return_var=True)
+                samples = sampler.sweep()
+                if tune and i == 1:
+                    energy, second = first_cuda_measurement(config, state, hamiltonian, samples, logger)
+                else:
+                    energy, second = hamiltonian.expectation(state, samples, return_var=True)
                 if i == 1:
                     _log_cuda_paths(logger, config, state, sampler, hamiltonian)
                 sum_energy += energy

@@ -33,6 +33,7 @@ class Config:
     step_size: float = 1e-3
     max_parallel: int = 32768
     projected_forward_batch: int | None = None  # None tunes local energy and uses 1024 for sampling.
+    local_energy_forward_batch: int | None = None
     projected_periodic_conv: bool = True  # IEEE FP32 periodic convolution on supported CUDA GPUs.
     projected_local_energy_graph: bool = True  # Replay full batches of connected configurations.
     projected_exchange_graph: bool = True  # Replay compacted CUDA exchange proposals.
@@ -54,6 +55,8 @@ class Config:
             raise ValueError("jacobian_batch must be positive.")
         if self.projected_forward_batch is not None and self.projected_forward_batch < 1:
             raise ValueError("projected_forward_batch must be positive.")
+        if self.local_energy_forward_batch is not None and not 1 <= self.local_energy_forward_batch <= self.max_parallel:
+            raise ValueError("local_energy_forward_batch must be positive and at most max_parallel.")
         if self.eigh_backend not in (None, "default", "cusolver", "magma"):
             raise ValueError("eigh_backend must be default, cusolver, or magma.")
         if not all(math.isfinite(x) for x in (self.J1, self.J2, self.step_size)) or self.step_size <= 0:
@@ -99,8 +102,10 @@ def add_common_options(parser):
         parser.add_argument(f"--{flag}", dest=name, type=kind, default=value)
     parser.add_argument("--projected-forward-batch", type=int, default=defaults.projected_forward_batch,
                         help="Fix the projected CUDA forward batch in orbit members. By default local energy tunes it.")
+    parser.add_argument("--local-energy-forward-batch", type=int, default=defaults.local_energy_forward_batch,
+                        help="Fix only the local-energy forward batch, in orbit members.")
     parser.add_argument("--jacobian-batch", type=int, default=defaults.jacobian_batch,
-                        help="Samples per MinSR derivative batch. Defaults to an estimate from GPU memory.")
+                        help="Samples per MinSR derivative batch. CUDA training tunes and caches this when omitted.")
     parser.add_argument("--eigh-backend", choices=("default", "cusolver", "magma"), default=defaults.eigh_backend,
                         help="Select the CUDA linear algebra backend for the training process.")
     parser.add_argument("--projected-periodic-conv", action=argparse.BooleanOptionalAction,

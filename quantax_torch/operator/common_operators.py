@@ -13,10 +13,17 @@ from ..symmetry import Symmetry
 _MAX_EXCHANGE_MASK_ELEMENTS = 2**22
 
 
-def _tune_exchange_batch(state, accumulate, configs, rows, terms, result, base):
+def _exchange_batch_candidates(state, base):
+    if state.nsymm == 1:
+        return tuple(sorted({max(1, base // 4), max(1, base // 2), base}))
+    limit = min(4096, state.max_parallel or 4096) // state.nsymm
+    return tuple(batch for batch in (base, 2 * base, 4 * base) if batch <= max(base, limit))
+
+
+def _tune_exchange_batch(state, accumulate, configs, rows, terms, result, base, *, replay):
     orbit = state.nsymm
-    limit = min(4096, state.max_parallel or 4096) // orbit
-    candidates = [batch for batch in (base, 2 * base, 4 * base) if batch <= limit and len(rows) >= 32 * batch]
+    minimum_batches = 32 if replay else 8
+    candidates = [batch for batch in _exchange_batch_candidates(state, base) if len(rows) >= minimum_batches * batch]
     if len(candidates) < 2:
         return base
     width = state.ansatz[0].config["channels"]
@@ -26,9 +33,8 @@ def _tune_exchange_batch(state, accumulate, configs, rows, terms, result, base):
                   if batch == base or 32 * batch * orbit * state.nsites * width <= free // 4]
     if len(candidates) < 2:
         return base
-    # Benchmark replay, which has a different launch profile from eager forward.
     multiple = 4 * max(candidates)
-    count = min(len(rows), 256 * base) // multiple * multiple
+    count = min(len(rows), (256 if replay else 8) * base) // multiple * multiple
     rows, terms = rows[:count], terms[:count]
     current = torch.cuda.current_stream(configs.device)
     saved_maximum = state._maximum.clone()
@@ -38,14 +44,23 @@ def _tune_exchange_batch(state, accumulate, configs, rows, terms, result, base):
     try:
         for batch in candidates:
             scratch.zero_()
-            probe = _LocalEnergyGraph(accumulate, configs, scratch, rows, terms, batch, state._maximum,
-                                      current, None)
-            start.record()
-            probe.replay(configs, scratch, rows, terms)
+            if replay:
+                probe = _LocalEnergyGraph(accumulate, configs, scratch, rows, terms, batch, state._maximum,
+                                          current, None)
+                start.record()
+                probe.replay(configs, scratch, rows, terms)
+            else:
+                indices = torch.arange(batch, device=rows.device)
+                accumulate(configs, scratch, rows[:batch], terms[:batch], indices)
+                scratch.zero_()
+                start.record()
+                for offset in range(0, count, batch):
+                    accumulate(configs, scratch, rows[offset:offset + batch], terms[offset:offset + batch], indices)
             stop.record()
             stop.synchronize()
             rates[batch] = start.elapsed_time(stop)
-            del probe
+            if replay:
+                del probe
     finally:
         state._maximum.copy_(saved_maximum)
     best = min(rates, key=rates.get)
@@ -131,14 +146,34 @@ def _replay_exchange(accumulate, configs, rows, terms, chunk, result, state, bon
 
 
 class _Heisenberg(Operator):
-    def __init__(self, terms, *, local_energy_graph, reuse_local_energy_pool=False, tune_local_energy=False):
+    def __init__(self, terms, *, local_energy_graph, reuse_local_energy_pool, tune_local_energy,
+                 local_energy_forward_batch):
         super().__init__(terms)
         self.local_energy_graph = local_energy_graph
         self._local_energy_graph_used = False
         self._local_energy_workspaces = {} if reuse_local_energy_pool else None
-        self._tune_local_energy = tune_local_energy
+        self._tune_local_energy = tune_local_energy and local_energy_forward_batch is None
+        self._fixed_forward_batch = local_energy_forward_batch
         self._local_energy_batch = None
         self._batch_key = None
+
+    @staticmethod
+    def _local_energy_key(state, device):
+        return device, id(state.ansatz[0]), state.nsymm, state.forward_batch, state.max_parallel
+
+    def _set_local_energy_batch(self, state, device, batch):
+        if not self._tune_local_energy or state.forward_batch is None or torch.are_deterministic_algorithms_enabled():
+            return False
+        base = state.forward_batch // state.nsymm
+        if state.nsymm == 1:
+            base = min(base, 2048)
+        elif _periodic_graph_net(state) is None:
+            return False
+        if batch not in _exchange_batch_candidates(state, base):
+            return False
+        self._batch_key = self._local_energy_key(state, device)
+        self._local_energy_batch = batch
+        return True
 
     @torch.no_grad()
     def psiOloc(self, state, samples):
@@ -165,6 +200,13 @@ class _Heisenberg(Operator):
             # A smaller convolution batch keeps the padded feature maps
             # smaller; max_parallel is a ceiling, not a required batch size.
             chunk = min(chunk, 2048)
+        fixed = self._fixed_forward_batch
+        if fixed is not None:
+            if (type(state) is not Variational or fixed < state.nsymm or fixed % state.nsymm
+                    or (max_parallel is not None and fixed > max_parallel)):
+                raise ValueError("The local-energy batch must fit max_parallel and contain whole orbits.")
+            chunk = fixed // state.nsymm
+            self._local_energy_batch = chunk
 
         # Compact exchanges in sample blocks so a large sample count can still
         # use replay while the temporary sample-by-bond arrays stay bounded.
@@ -175,13 +217,17 @@ class _Heisenberg(Operator):
                   and state._default_input and state._default_output
                   and not torch.are_deterministic_algorithms_enabled())
         net = _periodic_graph_net(state) if replay else None
-        tune = self._tune_local_energy and net is not None and getattr(net, "config", None) is not None
+        ordinary = (spins.is_cuda and state.nsymm == 1 and type(state) is Variational
+                    and not torch.are_deterministic_algorithms_enabled())
+        tune = (self._tune_local_energy and (ordinary or net is not None)
+                and getattr(state.ansatz[0], "config", None) is not None)
         if tune:
-            key = (spins.device, id(net), state.nsymm, forward_batch, max_parallel)
+            key = self._local_energy_key(state, spins.device)
             if self._batch_key != key:
                 self._local_energy_batch = None
                 self._batch_key = key
             base = chunk
+            tune_after = (64 if replay else 8) * base
         has_exchange = False
         for configs, wf, out in zip(spins.split(sample_batch), psi.split(sample_batch),
                                     result.split(sample_batch), strict=True):
@@ -197,7 +243,7 @@ class _Heisenberg(Operator):
                 idx = indices[:src.numel()]
                 connected[idx, left[term]] *= -1
                 connected[idx, right[term]] *= -1
-                if tune:
+                if fixed is not None or (tune and replay):
                     psi_connected = state._inference(connected)
                     state._record_maximum(psi_connected)
                 else:
@@ -206,11 +252,11 @@ class _Heisenberg(Operator):
                 out.index_add_(0, src, contribution.to(out.dtype))
 
             if tune:
-                if self._local_energy_batch is None and rows.numel() >= 64 * base:
+                if self._local_energy_batch is None and rows.numel() >= tune_after:
                     try:
                         with torch.cuda.device(spins.device):
                             self._local_energy_batch = _tune_exchange_batch(
-                                state, accumulate, configs, rows, terms, out, base
+                                state, accumulate, configs, rows, terms, out, base, replay=replay
                             )
                     except torch.cuda.OutOfMemoryError:
                         self._local_energy_batch = base
@@ -230,7 +276,7 @@ class _Heisenberg(Operator):
 
 
 def Heisenberg(J=1.0, n_neighbor=1, msr=False, *, local_energy_graph=False, reuse_local_energy_pool=False,
-               tune_local_energy=False):
+               tune_local_energy=False, local_energy_forward_batch=None):
     """Build a Heisenberg operator; graph replay requires a capture-safe inference backend."""
     J = [J] if isinstance(J, Number) else J
     shells = [n_neighbor] if isinstance(n_neighbor, int) else n_neighbor
@@ -246,7 +292,9 @@ def Heisenberg(J=1.0, n_neighbor=1, msr=False, *, local_energy_graph=False, reus
     terms = [["zz", diag], ["+-", exchange], ["-+", exchange]]
     if all(i != j for _, i, j in diag):
         return _Heisenberg(terms, local_energy_graph=local_energy_graph, reuse_local_energy_pool=reuse_local_energy_pool,
-                           tune_local_energy=tune_local_energy)
+                           tune_local_energy=tune_local_energy, local_energy_forward_batch=local_energy_forward_batch)
+    if local_energy_forward_batch is not None:
+        raise ValueError("A fixed local-energy batch requires bonds between distinct sites.")
     return Operator(terms)
 
 

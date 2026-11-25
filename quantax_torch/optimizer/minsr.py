@@ -110,15 +110,16 @@ class MinSR(TDVP):
         self._last_jacobian_batch = None
 
     def _derivative_batch(self, spins):
-        cap = min(len(spins), self._jacobian_batch_limit or len(spins))
+        count = len(spins)
+        cap = min(count, self._jacobian_batch_limit or count)
         if self.jacobian_batch is not None:
             return min(cap, self.jacobian_batch)
-        if not spins.is_cuda:
+        if cap <= 1 or not spins.is_cuda:
             return cap
         try:
             available, total = _cuda_memory(spins.device)
         except RuntimeError:
-            return 1
+            return 2
         params = tuple(self.state.parameters())
         dtype_bytes = max((param.element_size() for param in params), default=spins.element_size())
         total_params = sum(param.numel() for param in params)
@@ -128,15 +129,27 @@ class MinSR(TDVP):
         channels = max((p.shape[0] for p in params if p.ndim >= 3), default=1)
         orbit = self.state.nsymm
         feature_bytes = orbit * self.state.nsites * channels * dtype_bytes
-        # Saved block boundaries, cotangents, concatenation and live convolution tensors.
-        per_sample = max(1, 2 * (len(blocks) + 4) * feature_bytes + widest_block * dtype_bytes)
-        scalar_bytes = self.state.dtype.itemsize
-        # The Gram is allocated by get_Tmat before we get here. Reserve derivative
-        # outputs and FP64 centering temporaries that can coexist with activations.
-        fixed = len(spins) * (total_params * max(dtype_bytes, scalar_bytes)
-                              + 2 * widest_block * scalar_bytes)
-        headroom = max(0, available - fixed - total // 10)
-        return max(1, min(cap, headroom // (3 * per_sample)))
+        derivative_bytes = dtype_bytes * (2 if self.vs_type == 2 else 1)
+        activations = 2 * (len(blocks) + 4) * feature_bytes
+        block_row = widest_block * derivative_bytes
+        centering = 2 * widest_block * self.state.dtype.itemsize
+        native_rows = total_params * derivative_bytes
+        budget = available - total // 10
+
+        # A full batch streams parameter blocks. Native derivatives can
+        # accumulate for the solve, but there is no separate output assembly
+        # during differentiation. Budget the overlapping activations and the
+        # larger of block construction and accumulated derivatives/centering.
+        full_bytes = count * (activations + max(3 * block_row, native_rows + centering))
+        if cap == count and full_bytes <= budget:
+            return count
+
+        # A split batch assembles full-sample native buffers while computing
+        # each chunk. Centering then needs space for a promoted block.
+        fixed = count * (native_rows + centering)
+        per_sample = max(1, 3 * (activations + block_row))
+        # Try at least two samples unless an actual OOM has lowered the cap.
+        return max(2, min(cap, count - 1, (budget - fixed) // per_sample))
 
     @torch.no_grad()
     def _prepare(self, spins):
@@ -398,7 +411,9 @@ class MinSR(TDVP):
     @torch.no_grad()
     def get_step(self, samples):
         samples = self._gather_samples(samples)
-        Ebar = self.get_Ebar(samples)
+        return self._step_with_retry(samples, self.get_Ebar(samples))
+
+    def _step_with_retry(self, samples, Ebar):
         if self.state.device.type != "cuda" or self.process_group is not None:
             return self._step_from_energy(samples, Ebar)
 

@@ -166,6 +166,13 @@ def check_cuda_fast_paths():
     _check_exchange_sweep(eager, captured)
     state.update(opt.get_step(samples) * 1e-3)
     _check_exchange_sweep(eager, captured)
+    if state.inference_fn is not None:
+        eager, _ = _exchange_pair(state, spins)
+        _, compacted = _exchange_pair(state, spins, compact=True)
+        assert compacted._compact_key is not None
+        torch.testing.assert_close(compacted.current_spins, eager.current_spins, rtol=0, atol=0)
+        torch.testing.assert_close(compacted.current_wf, eager.current_wf, rtol=1e-10, atol=1e-13)
+        _check_exchange_sweep(eager, compacted)
     print("CUDA local energy, ordinary Jacobian and exchange replay agree with their references.")
 
     # The cache check compares independent FP32 backward passes exactly.
@@ -555,7 +562,7 @@ def check_cuda_derivative_batches():
         assert opt._derivative_batch(spins) == len(spins)
         expected = dict(opt.jacobian_blocks(spins))
     with patch.object(minsr, "_cuda_memory", return_value=(capacity // 10, capacity)):
-        assert opt._derivative_batch(spins) == 1
+        assert opt._derivative_batch(spins) == 2
         actual = dict(opt.jacobian_blocks(spins))
     for block in expected:
         torch.testing.assert_close(actual[block], expected[block], rtol=3e-5, atol=2e-6)
@@ -576,6 +583,20 @@ def check_cuda_derivative_batches():
         assert opt.get_step(samples).isfinite().all()
         energy.assert_called_once()
     assert opt.jacobian_batch is None and opt._last_jacobian_batch == len(spins) // 2
+
+    hamiltonian, state = _system(Config(depth=30, channels=64), False)
+    spins = torch.empty((1000, state.nsites), device=state.device, dtype=torch.int8)
+    opt = qtx.optimizer.MinSR(state, hamiltonian)
+    with patch.object(minsr, "_cuda_memory", return_value=(10 * 2**30, 12 * 2**30)):
+        assert opt._derivative_batch(spins) == len(spins)
+        opt._jacobian_batch_limit = len(spins) // 2
+        assert 2 < opt._derivative_batch(spins) < opt._jacobian_batch_limit
+
+    hamiltonian, state = _system(Config(depth=30, channels=64), True)
+    spins = torch.empty((1000, state.nsites), device=state.device, dtype=torch.int8)
+    opt = qtx.optimizer.MinSR(state, hamiltonian)
+    with patch.object(minsr, "_cuda_memory", return_value=(10 * 2**30, 12 * 2**30)):
+        assert 64 <= opt._derivative_batch(spins) < len(spins)
     print("CUDA Jacobian batches respond to memory headroom and shrink after an allocation failure.")
 
 

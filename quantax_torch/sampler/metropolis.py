@@ -18,6 +18,27 @@ def _track_proposals(uniforms, progress):
             progress(step, total)
 
 
+def _counted_exchange_forward(state):
+    if (not callable(getattr(torch, "nonzero_static", None))
+            or getattr(state, "inference_fn", None) is None or torch.are_deterministic_algorithms_enabled()
+            or torch.is_autocast_enabled("cuda")):
+        return None
+    from ..nn._cuda_support import periodic_cuda_issue
+    from ..state import Variational
+    from ..symmetry import Symmetry
+
+    if (type(state) is not Variational or type(state.symm) is not Symmetry
+            or len(state.ansatz) != 1 or not (state._default_input and state._default_output)):
+        return None
+    if periodic_cuda_issue(state.device) is not None:
+        return None
+    from ..nn._periodic_cuda import counted_res_sum_forward, res_sum_forward, supports_counted_res_sum
+
+    if state.inference_fn is res_sum_forward and supports_counted_res_sum(state.ansatz[0]):
+        return counted_res_sum_forward
+    return None
+
+
 class Metropolis(Sampler):
     """Metropolis sampling with optional progress every 100 thermalization proposals."""
 
@@ -110,7 +131,7 @@ class LocalFlip(Metropolis):
 class NeighborExchange(Metropolis):
     """Exchange sampler with optional graph replay and compaction of changed proposals.
 
-    With both flags set, supported projected CUDA networks replay compacted
+    With both flags set, supported CUDA networks replay compacted
     proposals; other networks use eager compaction.
     """
 
@@ -169,28 +190,13 @@ class NeighborExchange(Metropolis):
 
     def _compact_backend(self):
         state = self.state
-        if (not callable(getattr(torch, "nonzero_static", None)) or state.nsymm <= 1
-                or getattr(state, "inference_fn", None) is None or torch.are_deterministic_algorithms_enabled()
-                or torch.is_autocast_enabled("cuda")):
+        forward = _counted_exchange_forward(state)
+        if forward is None:
             return None
-        from ..nn._cuda_support import periodic_cuda_issue
-        from ..state import Variational
-        from ..symmetry import Symmetry
-
-        if (type(state) is not Variational or type(state.symm) is not Symmetry
-                or len(state.ansatz) != 1 or not (state._default_input and state._default_output)):
-            return None
-        if periodic_cuda_issue(state.device) is not None:
-            return None
-        from ..nn._periodic_cuda import counted_res_sum_forward, res_sum_forward, supports_counted_res_sum
-
-        if state.inference_fn is not res_sum_forward or not supports_counted_res_sum(state.ansatz[0]):
-            return None
-        cap = min(state.forward_batch or 2048, 2048)
-        batch = cap // state.nsymm
+        batch = min(state.forward_batch or 2048, 2048) // state.nsymm
         if batch <= 0:
             return None
-        return counted_res_sum_forward, batch
+        return forward, batch
 
     def _advance_compact(self, status, uniform, positions, forward, batch):
         state = self.state
