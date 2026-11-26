@@ -46,10 +46,10 @@ def main():
         samples = sampler.sweep()
         optimizer = None
         if measurement:
-            first_cuda_measurement(config, state, hamiltonian, samples, logger)
+            first_cuda_measurement(config, state, hamiltonian, samples, logger, benchmark=True)
         else:
             optimizer = qtx.optimizer.MinSR(state, hamiltonian, jacobian_batch=config.jacobian_batch, logger=logger)
-            update = first_cuda_step(config, optimizer, samples, symmetric, logger)
+            update = first_cuda_step(config, optimizer, samples, symmetric, logger, benchmark=True)
             if not bool(update.isfinite().all()):
                 raise FloatingPointError("Non-finite MinSR update during CUDA tuning.")
         _log_cuda_paths(logger, config, state, sampler, hamiltonian, optimizer)

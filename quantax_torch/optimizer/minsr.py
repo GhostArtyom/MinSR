@@ -110,6 +110,7 @@ class MinSR(TDVP):
         self._vjp_backend_choices = {}
         self._gram_backends = set()
         self._gram_backend_choices = {}
+        self._default_gram_backend = None
         self._last_cache_plan = (None, None)
         self._cache_limit = None
         self._jacobian_batch_limit = None
@@ -316,11 +317,13 @@ class MinSR(TDVP):
                 block = self._normalized_block(jac, samples.reweight_factor)
                 wide = block.shape[1] >= 4096
                 if tune and len(means) == 1 and wide:
-                    key = (T.device, block.shape)
-                    if key not in self._gram_backend_choices:
-                        with torch.cuda.device(T.device):
-                            self._gram_backend_choices[key] = tune_gram(T, block, tile)
-                    backend = self._gram_backend_choices[key]
+                    backend = self._default_gram_backend
+                    if backend is None:
+                        key = (T.device, block.shape)
+                        if key not in self._gram_backend_choices:
+                            with torch.cuda.device(T.device):
+                                self._gram_backend_choices[key] = tune_gram(T, block, tile)
+                        backend = self._gram_backend_choices[key]
                 if wide and backend == "cuBLAS SYRK" and add_gram_lower_(T, block):
                     lower_only = True
                     self._gram_backends.add("cuBLAS SYRK")

@@ -6,26 +6,26 @@
 
 先同步 PyTorch 环境。需要精确对角化等功能时，再单独安装本机编译的 QuSpin wheel。以下命令从仓库根目录运行。[安装说明](../README.md#python-311--pytorch-2100)
 
-常用配置都在 [`examples_torch/run_pipeline.py`](../examples_torch/run_pipeline.py) 开头，不需要单独的配置文件。`Config` 设置共享的晶格、网络和批量；`STAGES` 设置阶段长度，也可单独覆盖 `nsamples`、`max_parallel`、`thermal_steps` 和 `sweep_steps`。保持三阶段的晶格和网络一致。编辑后直接运行：
+常用配置都在 [`examples_torch/run_pipeline.py`](../examples_torch/run_pipeline.py)。`PIPELINE_CONFIG` 设置共享的晶格和网络，`STAGES` 设置阶段长度，也可单独覆盖 `nsamples`、`max_parallel`、批量、`thermal_steps` 和 `sweep_steps`。保持三阶段的晶格和网络一致。编辑后直接运行：
 
 ```bash
 .venv/bin/python -m examples_torch.run_pipeline
 ```
 
-也可以用命令行指定设备、种子、样本数和三个阶段的长度：
+也可以用命令行指定设备、种子、网络、样本数和三个阶段的长度。以下命令使用较小的网络复现早期配置：
 
 ```bash
 .venv/bin/python -m examples_torch.run_pipeline \
-  --device cuda --seed 2347 --nsamples 1000 \
+  --device cuda --seed 2347 --depth 16 --channels 16 --nsamples 1000 \
   --steps 2000 --symm-steps 1000 --measure-steps 100
 ```
 
-默认体系是 10×10 周期方格，$J_1=1$、$J_2=0.5$，`msr=True`，`ResSum(16, 16, 3, use_sinh=True)`。每阶段 1000 个样本，`max_parallel=32768`，交换采样使用第一和第二近邻。
+流水线默认使用 10 × 10 周期方格，$J_1=1$、$J_2=0.5$，`msr=True`，`ResSum(30, 64, 3, use_sinh=True)`。每阶段 1000 个样本，`max_parallel=32768`，交换采样使用第一和第二近邻。
 
 | 阶段 | 默认长度 | 对称约束 | `reweight` | 热化 / 交换 | 参数步长 |
 | --- | ---: | --- | ---: | ---: | --- |
-| 普通训练 | 2000 步 | `TotalSz(0)` | 1.0 | 2000 / 200 | 0.001 |
-| 对称性训练 | 1000 步 | `TotalSz(0) + SpinInverse() + C4v()` | 1.0 | 2000 / 200 | 0.001 |
+| 普通训练 | 4000 步 | `TotalSz(0)` | 1.0 | 2000 / 200 | 0.001 |
+| 对称性训练 | 2000 步 | `TotalSz(0) + SpinInverse() + C4v()` | 1.0 | 2000 / 200 | 0.001 |
 | 测量 | 100 轮 | `TotalSz(0) + SpinInverse() + C4v()` | 2.0 | 10000 / 1000 | — |
 
 普通训练默认随机初始化。使用 CUDA 时，卷积权重直接在 GPU 上生成，初始化和采样各自使用以 `--seed` 设置的生成器。使用 CPU 时，权重在 CPU 上生成。传入 `--initial-weights` 可从指定的 `.eqx` 或 `.pt` 权重起跑，执行全部阶段。已有普通训练最终权重时，用 `FROM_CHECKPOINT` 或 `--from-checkpoint` 直接开始对称性训练。单独运行对称性训练或测量时，用 `examples_torch.train_symm --param-file` 或 `examples_torch.measure --param-file`。测量也可用 `--network-idx` 选择内置网络预设。[对称性训练入口](../examples_torch/train_symm.py) · [测量入口](../examples_torch/measure.py)
@@ -34,11 +34,19 @@
 
 训练入口及流水线可传 `--reweight 2.0`，让训练按 $|\psi|^2$ 采样。默认 `--reweight 1.0` 沿用公开训练示例。对称性短跑可用 `--reweight 2.0 --diagnostics --param-file` 从指定权重开始，采样链会重新热化。两个采样指数使用同一 MinSR 求解流程，固定权重测量使用 2.0。[训练入口](../examples_torch/train_symm.py) · [采样器](../quantax_torch/sampler/metropolis.py)
 
-JAX 和 PyTorch MinSR 均用 `jacobian_batch` 设置每批求导的样本数，命令行参数为 `--jacobian-batch`。PyTorch CUDA 示例优先读取完全匹配的记录。没有匹配记录时，从相同 GPU 型号、执行路径和训练阶段的相近配置取起点，较大的网络会下调候选值。没有相近记录时，按当前显存估算。估算偏低时，训练示例从最多 32 个样本起试，受总样本数和单批前向可容纳的样本数限制。首步用热化后的实际样本验证批量，其更新直接用于训练。首步日志用 `samples/batch` 记录实际导数批量。前向用 `inputs`，采样图分组用 `chains/group`，对称性局域能量用 `orbit members/batch`。
+RTX 4070 Ti 匹配上述体系、网络、样本数和 CUDA 前向配置时，直接使用下表的实测参数。两个训练阶段的宽块 Gram 使用分块 GEMM，流水线的特征分解使用 PyTorch `default`。两个对称阶段的前向批量按轨道成员计，普通采样的 2048 是上限。[实测记录](pytorch-cuda-benchmark.md)
 
-普通训练、对称性训练和测量分别保存记录。记录按 GPU、PyTorch/CUDA 版本、网络、体系、样本数和后端配置匹配。训练记录包含验证通过的雅可比批量，以及已选出的 Gram 后端和局域能量前向批量。显存不足时用原样本回退，既有批量记录继续用于后续运行。普通训练默认比较每批 512、1024 和 2048 个连接构型，受 `max_parallel` 限制。对称性训练和测量在未显式指定 `projected_forward_batch` 且支持 CUDA Graph 时，也用热化后的样本选前向批量。文件默认保存在 `~/.cache/minsr/torch-cuda-tuning/`，设置 `XDG_CACHE_HOME` 后以该目录为根。日志记录使用的 JSON 路径，删除该文件可重新验证批量。 [CUDA 调优实现](../examples_torch/_cuda_tuning.py)
+| 阶段 | 雅可比样本/批 | 局域能量前向/批 | 采样前向/批 |
+| --- | ---: | ---: | ---: |
+| 普通训练 | 1000 | 512 | 2048 |
+| 对称性训练 | 125 | 4096 | 1024 |
+| 测量 | — | 4096 | 1024 |
 
-可以先用独立入口为指定网络和样本数生成记录。任选 `train`、`train_symm` 或 `measure`，每次按该阶段的配置热化并取一批样本，权重固定。以下用仓库附带的权重为测量阶段提前调优。省略 `--param-file` 时在 CUDA 上随机初始化，也可以传入自己的检查点。
+JAX 和 PyTorch MinSR 均用 `--jacobian-batch` 设置每批求导的样本数。PyTorch 正式运行在首步直接计算。其他 GPU 或网络配置优先读取完全匹配的记录。没有匹配记录时，局域能量用该路径的默认批量，雅可比批量取相近配置或用当前显存估算。符合条件的普通训练仍会在首次执行时短测反向内核，其他配置的宽块 Gram 也可在缓存未命中时短测后端。正式首步的局域能量和 MinSR 遇到可重试的显存不足时，用原样本缩批。首步日志记录实际执行批量。[CUDA 参数选择](../examples_torch/_cuda_tuning.py)
+
+普通训练、对称性训练和测量的调优记录分别按 GPU、PyTorch/CUDA 版本、网络、体系、样本数和后端配置匹配。文件默认保存在 `~/.cache/minsr/torch-cuda-tuning/`，设置 `XDG_CACHE_HOME` 后以该目录为根。日志记录使用的 JSON 路径。
+
+可以用独立入口为指定网络和样本数生成调优记录。任选 `train`、`train_symm` 或 `measure`，按阶段配置热化并取一批样本，权重固定。没有匹配的局域能量记录时，独立入口会实测前向候选批量。以下用仓库附带的权重为测量阶段提前调优。省略 `--param-file` 时在 CUDA 上随机初始化，也可以传入自己的检查点。
 
 ```bash
 .venv/bin/python -m examples_torch.tune_cuda measure --depth 30 --channels 64 --nsamples 1000 \
@@ -57,7 +65,7 @@ JAX 和 PyTorch MinSR 均用 `jacobian_batch` 设置每批求导的样本数，�
 
 单进程 CUDA MinSR 更新遇到显存分配错误时，用原样本缩减导数缓存或批量后重试。中心化、Gram 矩阵和求解始终使用全部样本。 [MinSR 实现](../quantax_torch/optimizer/minsr.py)
 
-结果默认写到 `runs/torch/<system>/<timestamp>/`。训练输出日志、PDF 和权重，默认最终权重为 `params_2000.pt` 和 `params_symm_1000.pt`。测量输出 `measurement.log`、`measurement.csv` 和 `summary.json`。各阶段在热化开始、每完成 100 次交换提议以及热化结束时写入进度，后两列分别为距上次报告的区间耗时和阶段累计耗时，单位均为秒。
+结果默认写到 `runs/torch/<system>/<timestamp>/`。训练输出日志、PDF 和权重，流水线的默认最终权重为 `params_4000.pt` 和 `params_symm_2000.pt`。测量输出 `measurement.log`、`measurement.csv` 和 `summary.json`。各阶段在热化开始、每完成 100 次交换提议以及热化结束时写入进度，后两列分别为距上次报告的区间耗时和阶段累计耗时，单位均为秒。
 
 临时测试用 `--output-dir runs/<测试名>` 指定独立的输出根目录。
 
@@ -67,14 +75,14 @@ JAX 和 PyTorch MinSR 均用 `jacobian_batch` 设置每批求导的样本数，�
 
 | 配置 | 用途 |
 | --- | --- |
-| `projected_forward_batch` | 按展开后的对称轨道成员固定对称性前向批量，同时受 `max_parallel` 限制。默认采样用 1024，局域能量按设备实测选择 1024、2048 或 4096。 |
+| `projected_forward_batch` | 按展开后的对称轨道成员设置采样和局域能量的基础前向批量，受 `max_parallel` 限制。省略时，采样默认用 1024，局域能量可使用预设或缓存。 |
 | `local_energy_forward_batch` | 单独固定局域能量的前向批量，按轨道成员计数，须容纳整数个轨道且至多为 `max_parallel`。同时设置 `projected_forward_batch` 时，采样使用自己的批量。 |
 | `projected_periodic_conv` / `ordinary_periodic_conv` | 分别控制对称阶段和普通训练的专用周期卷积前向。 |
 | `projected_local_energy_graph` | 对称阶段的局域能量整批前向重放。 |
 | `projected_exchange_graph` | 对称阶段的压缩交换提议重放。 |
 | `eigh_backend` | 训练进程的 CUDA 线性代数后端偏好。`default` 采用 PyTorch 默认分派，`cusolver` 和 `magma` 分别优先使用 cuSOLVER 和 MAGMA。省略时沿用进程原设定，日志显示当前偏好。大型 FP64 求解在可用显存偏低时可释放空闲缓存，显式选择 MAGMA 时跳过这一步。 |
 
-周期卷积、对称性局域能量重放和压缩交换提议重放在支持 Triton 的 NVIDIA CUDA 设备（计算能力 8.0 起）上按网络形状和精度启用。普通训练首次按设备计时，在周期卷积反向和 `unfold` 之间选路。符合条件的实值 FP64 Gram 在当前设备上计时选择全矩阵、三角分块或 `SYRK`。局域能量复用整批的 CUDA Graph，余数走普通前向。采样链超出单图容量时分组重放。实际路径可查训练日志和测量摘要。 [实现改进](implementation-improvements.md#pytorch-实现优化)
+周期卷积、对称性局域能量重放和压缩交换提议重放在支持 Triton 的 NVIDIA CUDA 设备（计算能力 8.0 起）上按网络形状和精度启用。局域能量复用整批的 CUDA Graph，余数走普通前向。采样链超出单图容量时分组重放。实际路径可查训练日志和测量摘要。[实现改进](implementation-improvements.md#pytorch-实现优化)
 
 ## 数值验收
 

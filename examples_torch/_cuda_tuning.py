@@ -11,6 +11,27 @@ from tempfile import NamedTemporaryFile
 import torch
 
 
+_RTX_4070_TI_BATCHES = {
+    "train": (1000, 512),
+    "train_symm": (125, 4096),
+    "measure": (None, 4096),
+}
+
+
+def _batch_preset(key):
+    stage = key["stage"]
+    if (key["gpu"][0] == "NVIDIA GeForce RTX 4070 Ti"
+            and key["system"] == [10, 1.0, 0.5]
+            and key["network"] == {"depth": 30, "channels": 64, "kernel_size": 3, "use_sinh": True}
+            and key["samples"] == 1000 and key["max_parallel"] == 32768
+            and key["dtype"] == "torch.float64" and key["parameter_dtype"] == "torch.float32"
+            and key["forward_batch"] is None
+            and key["inference"] == [True, 2048 if stage == "train" else 1024]
+            and (stage == "train" or (key["local_energy_graph"] and key["exchange_graph"]))):
+        return _RTX_4070_TI_BATCHES[stage]
+    return None
+
+
 def _cache_file(config, state, device, stage):
     gpu = torch.cuda.get_device_properties(device)
     key = {
@@ -130,31 +151,43 @@ def _initial_batch(optimizer, samples, path, key, logger):
     return batch
 
 
-def _evaluate_local_energy(state, hamiltonian, samples, evaluate, batch, logger):
-    if type(batch) is not int or not hamiltonian._set_local_energy_batch(state, samples.spins.device, batch):
+def _evaluate_local_energy(state, hamiltonian, samples, evaluate, batch, logger, *, benchmark):
+    if not hamiltonian._tune_local_energy or state.forward_batch is None:
         return evaluate(samples)
 
-    maximum = state._maximum.clone()
-    try:
-        return evaluate(samples)
-    except torch.cuda.OutOfMemoryError:
-        logger.warning("Cached CUDA local-energy batch ran out of memory. Retrying with the default batch.")
-    if hamiltonian._local_energy_workspaces is not None:
-        hamiltonian._local_energy_workspaces.clear()
     base = state.forward_batch // state.nsymm
-    hamiltonian._local_energy_batch = min(base, 2048) if state.nsymm == 1 else base
-    state._maximum.copy_(maximum)
-    torch.cuda.empty_cache()
-    return evaluate(samples)
+    if state.nsymm == 1:
+        base = min(base, 2048)
+    device = samples.spins.device
+    if type(batch) is not int or not hamiltonian._set_local_energy_batch(state, device, batch):
+        if benchmark or not hamiltonian._set_local_energy_batch(state, device, base):
+            return evaluate(samples)
+        batch = base
+
+    maximum = state._maximum.clone()
+    while True:
+        try:
+            return evaluate(samples)
+        except torch.cuda.OutOfMemoryError:
+            if batch <= 1:
+                raise
+        batch = min(base, batch // 2)
+        logger.warning(f"CUDA local energy out of memory. Retrying with {batch * state.nsymm} inputs/batch.")
+        if hamiltonian._local_energy_workspaces is not None:
+            hamiltonian._local_energy_workspaces.clear()
+        hamiltonian._local_energy_batch = batch
+        state._maximum.copy_(maximum)
+        torch.cuda.empty_cache()
 
 
 @torch.no_grad()
-def first_cuda_step(config, optimizer, samples, symmetric, logger):
+def first_cuda_step(config, optimizer, samples, symmetric, logger, *, benchmark=False):
     """Select and verify the batch while computing the first training update."""
     state, hamiltonian = optimizer.state, optimizer.hamiltonian
     device = samples.spins.device
     path, key = _cache_file(config, state, device, "train_symm" if symmetric else "train")
-    record = _read_record(path, key)
+    preset = None if benchmark else _batch_preset(key)
+    record = _read_record(path, key) if preset is None else {}
     saved_batch = record.get("jacobian_batch")
     if type(saved_batch) is not int or not 1 <= saved_batch <= len(samples.spins):
         saved_batch = None
@@ -166,12 +199,21 @@ def first_cuda_step(config, optimizer, samples, symmetric, logger):
                     and backend in ("full GEMM", "tiled GEMM", "cuBLAS SYRK")):
                 optimizer._gram_backend_choices[device, torch.Size((len(samples.spins), int(width)))] = backend
 
+    local_batch = record.get("local_energy_batch")
+    if preset is not None:
+        optimizer._default_gram_backend = "tiled GEMM"
+        local_batch = preset[1] // state.nsymm
+        if hamiltonian._tune_local_energy:
+            logger.info(f"CUDA local-energy preset: {preset[1]} inputs/batch")
     Ebar = _evaluate_local_energy(state, hamiltonian, samples, optimizer.get_Ebar,
-                                 record.get("local_energy_batch"), logger)
+                                 local_batch, logger, benchmark=benchmark)
 
     manual_batch = optimizer.jacobian_batch
     if manual_batch is not None:
         batch = manual_batch
+    elif preset is not None:
+        batch = preset[0]
+        logger.info(f"CUDA Jacobian batch preset: {batch}")
     elif saved_batch is None:
         batch = _initial_batch(optimizer, samples, path, key, logger)
     else:
@@ -180,11 +222,14 @@ def first_cuda_step(config, optimizer, samples, symmetric, logger):
     optimizer.jacobian_batch = batch
     cache_limit = optimizer._cache_limit
     update = optimizer._step_with_retry(samples, Ebar)
+    if preset is not None:
+        return update
 
     # Keep the tuned Jacobian batch on disk after an OOM fallback.
     verified = (manual_batch is None and saved_batch is None and batch == optimizer._last_jacobian_batch
                 and cache_limit == optimizer._cache_limit and bool(update.isfinite().all()))
-    local_batch = getattr(hamiltonian, "_local_energy_batch", None)
+    if benchmark:
+        local_batch = hamiltonian._local_energy_batch
     settings = {
         "key": key,
         "jacobian_batch": batch if verified else saved_batch,
@@ -197,14 +242,20 @@ def first_cuda_step(config, optimizer, samples, symmetric, logger):
     return update
 
 
-def first_cuda_measurement(config, state, hamiltonian, samples, logger, **expectation_options):
+def first_cuda_measurement(config, state, hamiltonian, samples, logger, *, benchmark=False,
+                           **expectation_options):
     path, key = _cache_file(config, state, samples.spins.device, "measure")
-    record = _read_record(path, key)
     evaluate = partial(hamiltonian.expectation, state, return_var=True, **expectation_options)
+    preset = None if benchmark else _batch_preset(key)
+    if preset is not None:
+        logger.info(f"CUDA local-energy preset: {preset[1]} orbit members/batch")
+        return _evaluate_local_energy(state, hamiltonian, samples, evaluate, preset[1] // state.nsymm, logger,
+                                      benchmark=False)
+    record = _read_record(path, key)
     saved_batch = record.get("local_energy_batch")
-    result = _evaluate_local_energy(state, hamiltonian, samples, evaluate, saved_batch, logger)
+    result = _evaluate_local_energy(state, hamiltonian, samples, evaluate, saved_batch, logger, benchmark=benchmark)
     batch = hamiltonian._local_energy_batch
-    if batch is not None:
+    if batch is not None and (benchmark or saved_batch is not None):
         settings = {"key": key, "local_energy_batch": int(batch)}
         if settings == record:
             logger.info(f"CUDA local-energy tuning loaded: {path}")

@@ -13,8 +13,8 @@ FROM_CHECKPOINT = None  # Set to a training checkpoint to skip the first stage.
 # Keep lattice and network settings shared. A stage can override nsamples or
 # max_parallel, or set thermal_steps and sweep_steps instead of the defaults.
 STAGES = {
-    "train": {"steps": 2000},
-    "train_symm": {"steps": 1000},
+    "train": {"steps": 4000},
+    "train_symm": {"steps": 2000},
     "measure": {"steps": 100},
 }
 
@@ -33,7 +33,7 @@ class Config:
     training_reweight: float = 1.0
     step_size: float = 1e-3
     max_parallel: int = 32768
-    projected_forward_batch: int | None = None  # None tunes local energy and uses 1024 for sampling.
+    projected_forward_batch: int | None = None  # None uses 1024 for projected sampling.
     local_energy_forward_batch: int | None = None
     projected_periodic_conv: bool = True  # IEEE FP32 periodic convolution on supported CUDA GPUs.
     projected_local_energy_graph: bool = True  # Replay full batches of connected configurations.
@@ -88,6 +88,9 @@ class Config:
         return replace(self, depth=depth, channels=channels), ROOT / "params" / filename
 
 
+PIPELINE_CONFIG = Config(depth=30, channels=64, eigh_backend="default")
+
+
 PRESETS = {
     1: (16, 16, "square10x10_1616.eqx"),
     2: (16, 32, "square10x10_1632.eqx"),
@@ -95,8 +98,7 @@ PRESETS = {
 }
 
 
-def add_common_options(parser):
-    defaults = Config()
+def add_common_options(parser, defaults=Config()):
     for name in ("L", "J1", "J2", "depth", "channels", "kernel_size", "nsamples",
                  "step_size", "max_parallel",
                  "seed", "device", "output_dir"):
@@ -105,11 +107,11 @@ def add_common_options(parser):
         flag = name.lower().replace("_", "-")
         parser.add_argument(f"--{flag}", dest=name, type=kind, default=value)
     parser.add_argument("--projected-forward-batch", type=int, default=defaults.projected_forward_batch,
-                        help="Fix the projected CUDA forward batch in orbit members. By default local energy tunes it.")
+                        help="Set the projected CUDA sampling batch and local-energy default in orbit members.")
     parser.add_argument("--local-energy-forward-batch", type=int, default=defaults.local_energy_forward_batch,
                         help="Fix only the local-energy forward batch, in orbit members.")
     parser.add_argument("--jacobian-batch", type=int, default=defaults.jacobian_batch,
-                        help="Samples per MinSR derivative batch. CUDA training tunes and caches this when omitted.")
+                        help="Samples per MinSR derivative batch. CUDA uses a preset, cache, or estimate when omitted.")
     parser.add_argument("--eigh-backend", choices=("default", "cusolver", "magma"), default=defaults.eigh_backend,
                         help="Select the CUDA linear algebra backend for the training process.")
     parser.add_argument("--projected-periodic-conv", action=argparse.BooleanOptionalAction,
@@ -194,7 +196,7 @@ def main(config=None, *, steps=None, symm_steps=None, measure_steps=None, from_c
          initial_weights=None):
     if initial_weights is not None and from_checkpoint is not None:
         raise ValueError("Choose either initial weights or a finished ordinary training checkpoint.")
-    config = Config() if config is None else config
+    config = PIPELINE_CONFIG if config is None else config
     stages = {
         stage: _stage_options(stage, config, length)
         for stage, length in (("train", steps), ("train_symm", symm_steps), ("measure", measure_steps))
@@ -223,8 +225,8 @@ def main(config=None, *, steps=None, symm_steps=None, measure_steps=None, from_c
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    add_common_options(parser)
-    add_training_options(parser)
+    add_common_options(parser, PIPELINE_CONFIG)
+    add_training_options(parser, PIPELINE_CONFIG)
     parser.add_argument("--steps", type=int)
     parser.add_argument("--symm-steps", type=int)
     parser.add_argument("--measure-steps", type=int)
