@@ -197,10 +197,10 @@ def first_cuda_step(config, optimizer, samples, symmetric, logger):
     return update
 
 
-def first_cuda_measurement(config, state, hamiltonian, samples, logger):
+def first_cuda_measurement(config, state, hamiltonian, samples, logger, **expectation_options):
     path, key = _cache_file(config, state, samples.spins.device, "measure")
     record = _read_record(path, key)
-    evaluate = partial(hamiltonian.expectation, state, return_var=True)
+    evaluate = partial(hamiltonian.expectation, state, return_var=True, **expectation_options)
     saved_batch = record.get("local_energy_batch")
     result = _evaluate_local_energy(state, hamiltonian, samples, evaluate, saved_batch, logger)
     batch = hamiltonian._local_energy_batch

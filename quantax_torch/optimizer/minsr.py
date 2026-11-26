@@ -84,11 +84,14 @@ class MinSR(TDVP):
 
     ``jacobian_batch`` bounds the number of sampled configurations in a
     derivative batch. When omitted, CUDA chooses it from allocator headroom
-    and estimated temporary storage. Gram and solve use all samples.
+    and estimated temporary storage. Gram construction and the solve use
+    all samples in double precision.
     """
 
-    def __init__(self, state, hamiltonian, solver=None, *, jacobian_batch=None, process_group=None, logger=None):
-        super().__init__(state, hamiltonian, solver=minsr_pinv_eig() if solver is None else solver)
+    def __init__(self, state, hamiltonian, solver=None, *, jacobian_batch=None, process_group=None, logger=None,
+                 local_energy_observer=None):
+        super().__init__(state, hamiltonian, solver=minsr_pinv_eig() if solver is None else solver,
+                         local_energy_observer=local_energy_observer)
         if self.vs_type == 1:
             raise ValueError("MinSR does not support non-holomorphic complex parameters.")
         if jacobian_batch is not None:
@@ -100,6 +103,9 @@ class MinSR(TDVP):
         self.process_group = process_group
         self._layers = tuple(_block_layers(net) for net in state.ansatz)
         self._complex_params = any(p.is_complex() for p in state.parameters())
+        complex_derivatives = self.vs_type == 2 or self._complex_params or state.dtype.is_complex
+        self._derivative_dtype = torch.complex128 if complex_derivatives else torch.float64
+        self._gram_dtype = torch.float64 if self.vs_type == 2 else self._derivative_dtype
         self._vjp_backends = set()
         self._vjp_backend_choices = {}
         self._gram_backends = set()
@@ -132,7 +138,7 @@ class MinSR(TDVP):
         derivative_bytes = dtype_bytes * (2 if self.vs_type == 2 else 1)
         activations = 2 * (len(blocks) + 4) * feature_bytes
         block_row = widest_block * derivative_bytes
-        centering = 2 * widest_block * self.state.dtype.itemsize
+        centering = 2 * widest_block * self._derivative_dtype.itemsize
         native_rows = total_params * derivative_bytes
         budget = available - total // 10
 
@@ -274,17 +280,19 @@ class MinSR(TDVP):
             yield i, blocks.pop(i)
 
     def jacobian_blocks(self, spins):
-        """Yield state-dtype logarithmic derivatives in reverse network order."""
+        """Yield double-precision logarithmic derivatives in reverse network order."""
         for i, jac in self._native_jacobian_blocks(spins):
-            yield i, jac.to(self.state.dtype)
+            yield i, jac.to(self._derivative_dtype)
 
     def _normalized_block(self, jac, weight):
+        jac = jac.to(self._derivative_dtype)
+        weight = weight.to(jac.real.dtype)
         centered = self._center_jacobian(jac, weight)
         return _stack_components(centered) if self.vs_type == 2 else centered
 
     def get_Tmat(self, samples, *, _blocks=None, _native_cache=False, _retain_before=None):
         size = samples.nsamples * (2 if self.vs_type == 2 else 1)
-        dtype = samples.wave_function.real.dtype if self.vs_type == 2 else self.state.dtype
+        dtype = self._gram_dtype
         T = torch.zeros((size, size), device=self.state.device, dtype=dtype)
         means = []
         group = self.process_group
@@ -302,7 +310,7 @@ class MinSR(TDVP):
         lower_only = False
         blocks = self._native_jacobian_blocks if _native_cache else self.jacobian_blocks
         for i, raw in blocks(samples.spins):
-            jac = raw.to(self.state.dtype) if _native_cache else raw
+            jac = raw.to(self._derivative_dtype)
             means.append((jac * samples.reweight_factor[:, None]).mean(dim=0))
             if i % world == rank:
                 block = self._normalized_block(jac, samples.reweight_factor)
@@ -345,13 +353,17 @@ class MinSR(TDVP):
             first = sum(len(blocks) for _, blocks, _ in self._layers) - limit
             jacobians = self._native_jacobian_blocks(samples.spins, first)
         for _, jac in jacobians:
-            jac = jac.to(self.state.dtype)
             block = self._normalized_block(jac, weight)
             blocks.append(block.mH @ v)
         return blocks[::-1]
 
     def Ohvp(self, samples, v):
         return torch.cat(self._adjoint_blocks(samples, v))
+
+    def _solve(self, matrix, rhs):
+        if matrix.dtype != self._gram_dtype:
+            raise ValueError(f"MinSR Gram must be constructed in {self._gram_dtype}, got {matrix.dtype}.")
+        return super()._solve(matrix, rhs.to(matrix.dtype))
 
     def solve(self, samples, Tmat, Ebar):
         rhs = _stack_components(Ebar) if self.vs_type == 2 else Ebar
@@ -392,7 +404,7 @@ class MinSR(TDVP):
             budget = min(budget, self._cache_limit)
         if elements * element_size <= min(budget, _DERIVATIVE_CACHE_BYTES):
             return "normalized", None
-        if self.state.dtype != torch.float64 or not all(p.dtype == torch.float32 for p in params):
+        if self._derivative_dtype != torch.float64 or not all(p.dtype == torch.float32 for p in params):
             return None, None
         if elements * 4 <= budget:
             return "native", None
@@ -452,7 +464,7 @@ class MinSR(TDVP):
         self._last_jacobian_batch = None
         self._vjp_backends.clear()
         self._gram_backends.clear()
-        cache, retain_before = self._cache_plan(samples, Ebar.element_size())
+        cache, retain_before = self._cache_plan(samples, self._derivative_dtype.itemsize)
         self._last_cache_plan = cache, retain_before
         if cache is None:
             T = self.get_Tmat(samples)
@@ -466,10 +478,8 @@ class MinSR(TDVP):
             while blocks:
                 block = blocks.pop()
                 if native:
-                    # The usual VJP already produced FP32 derivatives. Only
-                    # the centering and solve use FP64; redo the centering at
-                    # that precision instead of saving a promoted tensor.
-                    block = self._normalized_block(block.to(self.state.dtype), samples.reweight_factor)
+                    # Promote the cached FP32 derivatives before centering.
+                    block = self._normalized_block(block, samples.reweight_factor)
                 step_blocks.append(block.mH @ v)
                 del block
             if retain_before is not None:

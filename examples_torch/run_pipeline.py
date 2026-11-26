@@ -30,6 +30,7 @@ class Config:
     kernel_size: int = 3
     use_sinh: bool = True
     nsamples: int = 1000
+    training_reweight: float = 1.0
     step_size: float = 1e-3
     max_parallel: int = 32768
     projected_forward_batch: int | None = None  # None tunes local energy and uses 1024 for sampling.
@@ -43,6 +44,7 @@ class Config:
     device: str = "cuda"
     output_dir: Path = ROOT / "runs" / "torch"
     eigh_backend: str | None = None
+    diagnostics: bool = False
 
     def __post_init__(self):
         if self.L < 2 or self.L % 2:
@@ -51,6 +53,8 @@ class Config:
             raise ValueError("depth must be positive and even.")
         if min(self.channels, self.kernel_size, self.nsamples, self.max_parallel) < 1:
             raise ValueError("Network and batch sizes must be positive.")
+        if self.training_reweight not in (1.0, 2.0):
+            raise ValueError("training_reweight must be 1.0 or 2.0.")
         if self.jacobian_batch is not None and self.jacobian_batch < 1:
             raise ValueError("jacobian_batch must be positive.")
         if self.projected_forward_batch is not None and self.projected_forward_batch < 1:
@@ -117,11 +121,18 @@ def add_common_options(parser):
     parser.add_argument("--ordinary-periodic-conv", action=argparse.BooleanOptionalAction,
                         default=defaults.ordinary_periodic_conv)
     parser.add_argument("--use-sinh", action=argparse.BooleanOptionalAction, default=defaults.use_sinh)
+    parser.add_argument("--diagnostics", action="store_true",
+                        help="Record step metrics, rolling training snapshots and numerical events.")
 
 
 def add_sampling_options(parser):
     parser.add_argument("--thermal-steps", type=int)
     parser.add_argument("--sweep-steps", type=int)
+
+
+def add_training_options(parser, defaults=Config()):
+    parser.add_argument("--reweight", dest="training_reweight", type=float, choices=(1.0, 2.0),
+                        default=defaults.training_reweight, help="Sampling exponent during training.")
 
 
 def _stage_options(stage, config, steps):
@@ -195,9 +206,17 @@ def main(config=None, *, steps=None, symm_steps=None, measure_steps=None, from_c
         checkpoint = Path(from_checkpoint).expanduser().resolve()
         if not checkpoint.is_file():
             raise FileNotFoundError(f"Training weights do not exist: {checkpoint}")
-    checkpoint = _run_stage("train_symm", checkpoint, *stages["train_symm"])
+    symm_config, symm_options = stages["train_symm"]
+    if config.diagnostics and from_checkpoint is None:
+        symm_options["diagnostics_file"] = checkpoint.parent / "diagnostics.csv"
+    checkpoint = _run_stage("train_symm", checkpoint, symm_config, symm_options)
     print(f"Symmetry checkpoint: {checkpoint}", flush=True)
-    summary = _run_stage("measure", checkpoint, *stages["measure"])
+    measure_config, measure_options = stages["measure"]
+    if config.diagnostics:
+        measure_options["diagnostics_file"] = symm_options.get(
+            "diagnostics_file", checkpoint.parent / "diagnostics.csv",
+        )
+    summary = _run_stage("measure", checkpoint, measure_config, measure_options)
     print(f"Measurement summary: {summary}", flush=True)
     return summary.parent
 
@@ -205,6 +224,7 @@ def main(config=None, *, steps=None, symm_steps=None, measure_steps=None, from_c
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     add_common_options(parser)
+    add_training_options(parser)
     parser.add_argument("--steps", type=int)
     parser.add_argument("--symm-steps", type=int)
     parser.add_argument("--measure-steps", type=int)

@@ -78,6 +78,37 @@ def minsr_batched_derivatives():
     np.testing.assert_allclose(batched.get_step(samples), reference.get_step(samples), rtol=1e-4, atol=1e-5)
 
 
+def minsr_gram_precision():
+    import quantax as qtx
+    from quantax.optimizer.solver import minsr_pinv_eig
+
+    default_dtype = qtx.get_default_dtype()
+    solver = minsr_pinv_eig()
+
+    def solve(gram, rhs):
+        assert gram.dtype == rhs.dtype == jnp.float64
+        return solver(gram, rhs)
+
+    try:
+        for dtype, expected_rows in ((jnp.float32, 8), (jnp.complex64, 16)):
+            qtx.set_default_dtype(dtype)
+            qtx.set_random_seed(42)
+            hamiltonian = qtx.operator.Heisenberg(J=[1, 0.5], n_neighbor=[1, 2], msr=True)
+            net = qtx.nn.ResSum(2, 4, 3, use_sinh=True)
+            state = qtx.state.Variational(net, symm=qtx.symmetry.TotalSz(), max_parallel=16)
+            spins = qtx.utils.rand_spins(8, state.total_sz)
+            weights = jnp.linspace(0.5, 1.5, len(spins), dtype=jnp.float32)
+            samples = qtx.sampler.Samples(spins, state(spins).astype(dtype), reweight=weights)
+            optimizer = qtx.optimizer.MinSR(state, hamiltonian, solver=solve, jacobian_batch=3)
+            gram = optimizer.get_Tmat(samples)
+            assert gram.dtype == jnp.float64 and gram.shape == (expected_rows, expected_rows)
+            rhs = (weights - weights.mean()).astype(dtype)
+            update = optimizer.solve(samples, gram, rhs)
+            assert update.dtype == jnp.float64 and bool(jnp.all(jnp.isfinite(update)))
+    finally:
+        qtx.set_default_dtype(default_dtype)
+
+
 def heisenberg_local_energy():
     import quantax as qtx
 
@@ -123,6 +154,7 @@ def main():
         for name, check in [
             ("minsr_updates", minsr_updates),
             ("minsr_batched_derivatives", minsr_batched_derivatives),
+            ("minsr_gram_precision", minsr_gram_precision),
             ("heisenberg_local_energy", heisenberg_local_energy),
         ]:
             if all(value == "PASS" for value in results.values()):

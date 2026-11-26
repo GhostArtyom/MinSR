@@ -20,18 +20,22 @@ def main():
     parser.add_argument("--symmetric", action="store_true")
     parser.add_argument("--matrix", action="store_true", help="Compare batch combinations for all three CUDA stages.")
     parser.add_argument("--save-tuning", action="store_true", help="Save verified matrix winners to the CUDA cache.")
+    parser.add_argument("--reweight", type=float, choices=(1.0, 2.0),
+                        help="Sampling exponent for an individual training benchmark. Default: 1.0.")
     parser.add_argument("--param-file", type=Path)
     parser.add_argument("--steps", type=int, default=5, help="Measured training steps (after warmup).")
     parser.add_argument("--warmup", type=int, default=2, help="Training steps excluded from the medians.")
     args = vars(parser.parse_args())
-    symmetric, matrix, save_tuning, param_file, steps, warmup, thermal, sweep = (
-        args.pop(k) for k in ("symmetric", "matrix", "save_tuning", "param_file", "steps", "warmup",
+    symmetric, matrix, save_tuning, reweight, param_file, steps, warmup, thermal, sweep = (
+        args.pop(k) for k in ("symmetric", "matrix", "save_tuning", "reweight", "param_file", "steps", "warmup",
                               "thermal_steps", "sweep_steps")
     )
     if steps < 1 or warmup < 1:
         parser.error("--steps and --warmup must be positive")
     config = Config(**args)
     if matrix:
+        if reweight is not None:
+            parser.error("--reweight applies only to an individual training benchmark")
         if (torch.device(config.device).type != "cuda" or torch.version.cuda is None
                 or not torch.cuda.is_available()):
             parser.error("--matrix requires an NVIDIA CUDA device")
@@ -60,7 +64,8 @@ def main():
         sync()
         return perf_counter() - start, out
 
-    setup, sampler = timed(workflows._sampler, config, state, 1.0, thermal, sweep, None)
+    reweight = 1.0 if reweight is None else reweight
+    setup, sampler = timed(workflows._sampler, config, state, reweight, thermal, sweep, None)
     opt = qtx.optimizer.MinSR(state, hamiltonian, jacobian_batch=config.jacobian_batch)
     get_ebar = opt.get_Ebar
     eloc_seconds = 0.0
@@ -71,7 +76,7 @@ def main():
         return rhs
 
     opt.get_Ebar = timed_ebar
-    print(json.dumps(dict(config=asdict(config), symmetric=symmetric, checkpoint=param_file,
+    print(json.dumps(dict(config=asdict(config), symmetric=symmetric, checkpoint=param_file, reweight=reweight,
                           thermal=thermal, sweep=sweep, setup_seconds=setup, torch=torch.__version__,
                           device=torch.cuda.get_device_name(state.device) if state.device.type == "cuda" else "cpu"),
                      default=str), flush=True)
@@ -88,6 +93,9 @@ def main():
         row = dict(step=i + 1, warmup=i < warmup, sampling=sampling, local_energy=eloc_seconds,
                    minsr=optimize - eloc_seconds, update=apply, total=sampling + optimize + apply,
                    energy=opt.energy.item(), variance=opt.VarE.item())
+        weights = samples.reweight_factor.to(torch.float64)
+        row["importance_effective_samples"] = (weights.sum().square() / weights.square().sum()).item()
+        row["parameter_update_norm"] = torch.linalg.vector_norm(update[1:]).item() * config.step_size
         if memory is not None:
             row["cuda_memory"] = finish_cuda_step(state.device, memory)
             row["jacobian_batch"] = opt._last_jacobian_batch

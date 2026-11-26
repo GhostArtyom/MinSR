@@ -10,7 +10,8 @@ def _stack_components(x):
 
 
 class TDVP:
-    def __init__(self, state, hamiltonian, imag_time=True, solver=None, use_kazcmarz=False):
+    def __init__(self, state, hamiltonian, imag_time=True, solver=None, use_kazcmarz=False, *,
+                 local_energy_observer=None):
         self.state = state
         self.hamiltonian = hamiltonian
         self.imag_time = imag_time
@@ -21,6 +22,7 @@ class TDVP:
         self._solver_info = None
         self._last_step = None
         self._use_kazcmarz = use_kazcmarz
+        self._local_energy_observer = local_energy_observer
 
     @property
     def vs_type(self):
@@ -32,7 +34,10 @@ class TDVP:
         Emean = (Eloc * weight).mean()
         self.energy = Emean.real
         self.VarE = ((Eloc - Emean).abs().square() * weight).mean()
-        return (Eloc - Eloc.mean()) * (weight / samples.nsamples).sqrt()
+        unweighted_mean = Eloc.mean()
+        if self._local_energy_observer is not None:
+            self._local_energy_observer(Eloc, self.energy, self.VarE, unweighted_mean)
+        return (Eloc - unweighted_mean) * (weight / samples.nsamples).sqrt()
 
     def _center_jacobian(self, jac, weight):
         return (jac - jac.mean(dim=0)) * (weight[:, None] / len(weight)).sqrt()

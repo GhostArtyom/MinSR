@@ -16,6 +16,7 @@ from quantax_torch.utils import (
 )
 from quantax_torch.utils.logger import thermalization_progress
 from ._cuda_tuning import first_cuda_measurement, first_cuda_step
+from .diagnostics import StepDiagnostics
 
 
 def _periodic_forward_issue(config, device, symmetric):
@@ -184,7 +185,8 @@ def _log_cuda_paths(logger, config, state, sampler, hamiltonian, optimizer=None)
         optimizer.log_backends(logger)
 
 
-def train(config, *, steps, param_file=None, symmetric=False, thermal_steps=None, sweep_steps=None):
+def train(config, *, steps, param_file=None, symmetric=False, thermal_steps=None, sweep_steps=None,
+          diagnostics_file=None):
     if steps < 1:
         raise ValueError("steps must be positive.")
     if symmetric and param_file is None:
@@ -195,21 +197,29 @@ def train(config, *, steps, param_file=None, symmetric=False, thermal_steps=None
     start = perf_counter()
     run, logger, handler = create_run(config.output_dir, config.system, f"minsr.torch.train{suffix}",
                                       log_file=f"training{suffix}.log")
+    if config.diagnostics:
+        print(f"Stage log: {run / f'training{suffix}.log'}", flush=True)
     previous_backend = None
     try:
         hamiltonian, state = _system(config, symmetric, checkpoint)
         if state.device.type == "cuda" and config.eigh_backend is not None:
             previous_backend = torch.backends.cuda.preferred_linalg_library()
             torch.backends.cuda.preferred_linalg_library(config.eigh_backend)
-        _header(logger, config, state, steps, thermal, sweep, symmetric, 1.0, checkpoint)
+        reweight = config.training_reweight
+        _header(logger, config, state, steps, thermal, sweep, symmetric, reweight, checkpoint)
         if state.device.type == "cuda":
             logger.info(f"CUDA eigensolver: {torch.backends.cuda.preferred_linalg_library().name}")
         logger.info(f"Step size: {config.step_size:g} | Jacobian batch={config.jacobian_batch or 'auto'}")
+        diagnostics = None
+        if config.diagnostics:
+            diagnostics = StepDiagnostics(config, state, hamiltonian, run, f"train{suffix}", logger, diagnostics_file)
         optimizer = qtx.optimizer.MinSR(
             state, hamiltonian, jacobian_batch=config.jacobian_batch, logger=logger,
+            solver=None if diagnostics is None else diagnostics.solve,
+            local_energy_observer=None if diagnostics is None else diagnostics.record_energy,
         )
         setup_plot_font()
-        sampler = _sampler(config, state, 1.0, thermal, sweep, thermalization_progress(logger, start))
+        sampler = _sampler(config, state, reweight, thermal, sweep, thermalization_progress(logger, start))
         energies, variances = DataTracer(), DataTracer()
         title = f"J1-J2 Heisenberg, square {config.L}x{config.L}, J1={config.J1:g}, J2={config.J2:g}"
         baseline = -199.0859 if (config.L, config.J1, config.J2) == (10, 1.0, 0.5) else None
@@ -218,14 +228,28 @@ def train(config, *, steps, param_file=None, symmetric=False, thermal_steps=None
         tune = state.device.type == "cuda" and torch.version.cuda is not None
         for n in range(1, steps + 1):
             step_start = perf_counter()
-            samples = sampler.sweep()
-            if tune and n == 1:
-                update = first_cuda_step(config, optimizer, samples, symmetric, logger)
-            else:
-                update = optimizer.get_step(samples)
-            if not bool(update.isfinite().all()):
-                raise FloatingPointError(f"Non-finite update at step {n}.")
-            state.update(update * config.step_size)
+            if diagnostics is not None:
+                diagnostics.begin(n)
+            try:
+                samples = sampler.sweep()
+                if diagnostics is not None:
+                    diagnostics.record_samples(samples)
+                if tune and n == 1:
+                    update = first_cuda_step(config, optimizer, samples, symmetric, logger)
+                else:
+                    update = optimizer.get_step(samples)
+                scaled_step = update * config.step_size
+                if diagnostics is not None:
+                    diagnostics.record_update(scaled_step)
+                if not bool(update.isfinite().all()):
+                    raise FloatingPointError(f"Non-finite update at step {n}.")
+                state.update(scaled_step)
+            except Exception as error:
+                if diagnostics is not None:
+                    diagnostics.finish(error=error, update_applied=False, optimizer=optimizer)
+                raise
+            if diagnostics is not None:
+                diagnostics.finish(update_applied=bool(diagnostics.scaled_step.isfinite().all()), optimizer=optimizer)
             if n == 1:
                 _log_cuda_paths(logger, config, state, sampler, hamiltonian, optimizer)
             energy, variance = optimizer.energy.item(), optimizer.VarE.item()
@@ -238,6 +262,7 @@ def train(config, *, steps, param_file=None, symmetric=False, thermal_steps=None
                 state.save(run / f"params{suffix}_{n}.pt", metadata={
                     "network": config.network, "L": config.L, "system": config.system,
                     "symmetry": _sector(symmetric), "step": n, "seed": config.seed,
+                    "reweight": reweight,
                 })
             end = perf_counter()
             log_progress(logger, energy, variance, n, steps, end - step_start, end - start)
@@ -252,16 +277,23 @@ def train(config, *, steps, param_file=None, symmetric=False, thermal_steps=None
     return run
 
 
-def measure(config, *, steps, param_file, preset=None, thermal_steps=None, sweep_steps=None):
+def measure(config, *, steps, param_file, preset=None, thermal_steps=None, sweep_steps=None, diagnostics_file=None):
     if steps < 1:
         raise ValueError("steps must be positive.")
     checkpoint = _checkpoint(param_file)
     thermal, sweep = config.sampling(thermal_steps, sweep_steps, measurement=True)
     start = perf_counter()
     run, logger, handler = create_run(config.output_dir, config.system, "minsr.torch.measure", "measurement.log")
+    if config.diagnostics:
+        print(f"Stage log: {run / 'measurement.log'}", flush=True)
     try:
         hamiltonian, state = _system(config, True, checkpoint)
         _header(logger, config, state, steps, thermal, sweep, True, 2.0, checkpoint)
+        diagnostics = None
+        expectation_options = {}
+        if config.diagnostics:
+            diagnostics = StepDiagnostics(config, state, hamiltonian, run, "measure", logger, diagnostics_file)
+            expectation_options["local_energy_observer"] = diagnostics.record_energy
         sampler = _sampler(config, state, 2.0, thermal, sweep, thermalization_progress(logger, start))
         tune = getattr(hamiltonian, "_tune_local_energy", False)
         fields = ["step", "energy", "second_moment", "mean_energy", "mean_variance", "step_seconds", "elapsed_seconds"]
@@ -273,11 +305,24 @@ def measure(config, *, steps, param_file, preset=None, thermal_steps=None, sweep
             stream.flush()
             for i in range(1, steps + 1):
                 step_start = perf_counter()
-                samples = sampler.sweep()
-                if tune and i == 1:
-                    energy, second = first_cuda_measurement(config, state, hamiltonian, samples, logger)
-                else:
-                    energy, second = hamiltonian.expectation(state, samples, return_var=True)
+                if diagnostics is not None:
+                    diagnostics.begin(i)
+                try:
+                    samples = sampler.sweep()
+                    if diagnostics is not None:
+                        diagnostics.record_samples(samples)
+                    if tune and i == 1:
+                        energy, second = first_cuda_measurement(
+                            config, state, hamiltonian, samples, logger, **expectation_options,
+                        )
+                    else:
+                        energy, second = hamiltonian.expectation(state, samples, return_var=True, **expectation_options)
+                except Exception as error:
+                    if diagnostics is not None:
+                        diagnostics.finish(error=error)
+                    raise
+                if diagnostics is not None:
+                    diagnostics.finish()
                 if i == 1:
                     _log_cuda_paths(logger, config, state, sampler, hamiltonian)
                 sum_energy += energy

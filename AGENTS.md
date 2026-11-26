@@ -44,6 +44,7 @@ MinSR is the reproduction repository for *Empowering deep neural quantum states 
 ## Numerical conventions
 
 - For reproduction and implementation optimizations, preserve the reference MinSR centering, pseudoinverse, fixed step size, and sampling rules. Compare changes on fixed weights and spin configurations when checking numerical agreement.
+- In both MinSR implementations, promote derivative blocks before Gram multiplication. Construct the Gram, solve, and multiply by the adjoint Jacobian in float64 for real matrices or complex128 for complex matrices. Keep this precision independent of network, state, and sample dtypes.
 - `Heisenberg` uses Pauli matrices. At identical couplings, its energy scale is four times that of the corresponding spin-operator convention. Check this normalization and distinguish total energy from energy per site before comparing results. `msr=True` flips the transverse exchange on first-neighbor bonds only.
 - `optimizer.VarE` is a centered local-energy variance estimate. The second value from `H.expectation(..., return_var=True)` is the uncentered second moment, not the variance. Neither is the standard error of the energy estimate.
 - The active lattice and numerical defaults are process-wide. Use a fresh process or restart the notebook kernel when switching systems or numerical configurations. `max_parallel` limits forward batch size, not all memory used for derivatives and MinSR solves.

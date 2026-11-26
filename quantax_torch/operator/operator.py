@@ -169,10 +169,14 @@ class Operator:
             samples = Samples(spins, state(spins))
         return self.psiOloc(state, samples) / samples.wave_function
 
-    def expectation(self, state, samples, return_var=False):
+    def expectation(self, state, samples, return_var=False, *, local_energy_observer=None):
         weights = samples.reweight_factor if isinstance(samples, Samples) else 1.0
         local = self.Oloc(state, samples)
-        energy = (weights * local).mean().real.item()
+        mean = (weights * local).mean()
+        energy = mean.real.item()
+        if local_energy_observer is not None:
+            variance = (weights * (local - mean).abs().square()).mean().real
+            local_energy_observer(local, mean.real, variance, local.mean())
         if return_var:
             return energy, (weights * local.abs().square()).mean().real.item()
         return energy

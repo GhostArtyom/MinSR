@@ -104,6 +104,39 @@ def check(reference):
     assert hamiltonian.Oloc(state, sampled).isfinite().all()
     assert "quspin" not in sys.modules
     print("CPU MinSR, exchange sampling and local energies passed without QuSpin.")
+    check_gram_precision("cpu")
+
+
+def check_gram_precision(device):
+    import torch
+    import quantax_torch as qtx
+    from quantax_torch.optimizer.solver import minsr_pinv_eig
+
+    qtx.sites.Square(4)
+    default_dtype = qtx.get_default_dtype()
+    solver = minsr_pinv_eig()
+
+    def solve(gram, rhs):
+        assert gram.dtype == rhs.dtype == torch.float64
+        return solver(gram, rhs)
+
+    try:
+        for dtype, expected_rows in ((torch.float32, 8), (torch.complex64, 16)):
+            qtx.set_default_dtype(dtype)
+            qtx.set_random_seed(42)
+            hamiltonian = qtx.operator.Heisenberg(J=[1, 0.5], n_neighbor=[1, 2], msr=True)
+            net = qtx.nn.ResSum(2, 4, 3, use_sinh=True)
+            state = qtx.state.Variational(net, symm=qtx.symmetry.TotalSz(), device=device)
+            spins = torch.as_tensor(configurations(), device=device)
+            weights = torch.linspace(0.5, 1.5, len(spins), dtype=torch.float32, device=device)
+            samples = qtx.sampler.Samples(spins, state(spins).to(dtype), reweight=weights)
+            optimizer = qtx.optimizer.MinSR(state, hamiltonian, solver=solve, jacobian_batch=3)
+            gram = optimizer.get_Tmat(samples)
+            assert gram.dtype == torch.float64 and gram.shape == (expected_rows, expected_rows)
+            assert optimizer.get_step(samples).isfinite().all()
+    finally:
+        qtx.set_default_dtype(default_dtype)
+    print(f"{device} MinSR promotes Gram and solver inputs for FP32 and complex64 states.")
 
 
 def _exchange_pair(state, spins, *, compact=False, reweight=1.0):
@@ -184,6 +217,7 @@ def check_cuda_fast_paths():
         torch.backends.cudnn.deterministic = deterministic
     check_cuda_gram_syrk()
     check_cuda_gram_dispatch()
+    check_gram_precision("cuda")
     check_cuda_eigh_cache()
     check_cuda_derivative_batches()
     issue = _periodic_forward_issue(Config(), device, True)

@@ -32,6 +32,8 @@
 
 普通训练和对称性训练沿用原版 MinSR 的中心化、伪逆和固定步长。训练遇到非有限值或求解失败时停止。
 
+训练入口及流水线可传 `--reweight 2.0`，让训练按 $|\psi|^2$ 采样。默认 `--reweight 1.0` 沿用公开训练示例。对称性短跑可用 `--reweight 2.0 --diagnostics --param-file` 从指定权重开始，采样链会重新热化。两个采样指数使用同一 MinSR 求解流程，固定权重测量使用 2.0。[训练入口](../examples_torch/train_symm.py) · [采样器](../quantax_torch/sampler/metropolis.py)
+
 JAX 和 PyTorch MinSR 均用 `jacobian_batch` 设置每批求导的样本数，命令行参数为 `--jacobian-batch`。PyTorch CUDA 示例优先读取完全匹配的记录。没有匹配记录时，从相同 GPU 型号、执行路径和训练阶段的相近配置取起点，较大的网络会下调候选值。没有相近记录时，按当前显存估算。估算偏低时，训练示例从最多 32 个样本起试，受总样本数和单批前向可容纳的样本数限制。首步用热化后的实际样本验证批量，其更新直接用于训练。首步日志用 `samples/batch` 记录实际导数批量。前向用 `inputs`，采样图分组用 `chains/group`，对称性局域能量用 `orbit members/batch`。
 
 普通训练、对称性训练和测量分别保存记录。记录按 GPU、PyTorch/CUDA 版本、网络、体系、样本数和后端配置匹配。训练记录包含验证通过的雅可比批量，以及已选出的 Gram 后端和局域能量前向批量。显存不足时用原样本回退，既有批量记录继续用于后续运行。普通训练默认比较每批 512、1024 和 2048 个连接构型，受 `max_parallel` 限制。对称性训练和测量在未显式指定 `projected_forward_batch` 且支持 CUDA Graph 时，也用热化后的样本选前向批量。文件默认保存在 `~/.cache/minsr/torch-cuda-tuning/`，设置 `XDG_CACHE_HOME` 后以该目录为根。日志记录使用的 JSON 路径，删除该文件可重新验证批量。 [CUDA 调优实现](../examples_torch/_cuda_tuning.py)
@@ -48,6 +50,8 @@ JAX 和 PyTorch MinSR 均用 `jacobian_batch` 设置每批求导的样本数，�
 ```bash
 .venv/bin/python -m scripts.benchmark_torch_training --matrix --depth 30 --channels 64 --nsamples 1000 --save-tuning
 ```
+
+对比采样指数时，单独运行训练基准两次，分别传入 `--reweight 1.0` 和 `--reweight 2.0`。用同一个 `--param-file`、随机种子、样本数和批量设置。加上 `--symmetric` 可测投影后的训练。终端逐步输出采样、局域能量、MinSR 和完整更新的耗时，以及能量、中心方差、参数更新范数和重加权有效样本数。耗时中位数排除预热和热化，重加权有效样本数只反映权重集中程度。[训练基准](../scripts/benchmark_torch_training.py)
 
 已有候选时，可以按 [批量实测与选择](pytorch-cuda-benchmark.md) 交替短测，记录逐步的分配峰值、预留峰值和驱动空闲量。WSL 下也可同时采样 Windows 的专用及共享 GPU 内存。
 

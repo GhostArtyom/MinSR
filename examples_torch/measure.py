@@ -5,7 +5,7 @@ from .run_pipeline import Config, PRESETS, add_common_options, add_sampling_opti
 
 
 def main(param_file=None, config=None, *, network_idx=None, steps=100,
-         thermal_steps=None, sweep_steps=None):
+         thermal_steps=None, sweep_steps=None, diagnostics_file=None):
     from .workflows import measure
 
     config = Config() if config is None else config
@@ -15,7 +15,7 @@ def main(param_file=None, config=None, *, network_idx=None, steps=100,
         if param_file is None:
             param_file = bundled_weights
     return measure(config, steps=steps, param_file=param_file, preset=network_idx,
-                   thermal_steps=thermal_steps, sweep_steps=sweep_steps)
+                   thermal_steps=thermal_steps, sweep_steps=sweep_steps, diagnostics_file=diagnostics_file)
 
 
 if __name__ == "__main__":

@@ -104,6 +104,30 @@ initial_weights=/path/to/jax-initial.eqx
   --initial-weights "$initial_weights"
 ```
 
+## 用同一份 PyTorch 初值记录失稳
+
+JAX 和 PyTorch 的 MinSR 在中心化前将导数块提升到双精度。Gram 的乘法与累加、特征分解、软截断伪逆以及回乘 Jacobian 都用双精度，实矩阵用 float64，复矩阵用 complex128。实参数、复波函数的路径先堆叠导数的实部和虚部，再构造 FP64 Gram。网络前向、原始导数、采样振幅和权重存储可使用各自的 dtype。自定义 MinSR 求解器收到双精度的 Gram 和右端。[论文方法部分](Chen-2024-MinSR/paper.md#minsr-solution) · [JAX 实现](../quantax/optimizer/minsr.py) · [PyTorch 实现](../quantax_torch/optimizer/minsr.py)
+
+从仓库根目录运行以下命令。两个训练阶段使用 2000/200 次热化/交换，测量使用 10000/1000 次。诊断表 `diagnostics.csv` 位于普通训练的运行目录，后续阶段继续追加数据。在单独启动一个阶段时，诊断表保存在自己的运行目录。[PyTorch 流水线](../examples_torch/run_pipeline.py) · [诊断记录实现](../examples_torch/diagnostics.py)
+
+```bash
+initial_weights=runs/j1j2_square_10x10_J1-1_J2-0.5/initial-weights/params_0000_torch_cpu_seed2347.pt
+.venv/bin/python -m examples_torch.run_pipeline \
+  --diagnostics --device cuda --seed 2347 --nsamples 1000 \
+  --steps 2000 --symm-steps 1000 --measure-steps 100 \
+  --initial-weights "$initial_weights"
+```
+
+每个训练阶段在各自的 `diagnostics/rolling/` 保留最近 10 步。快照记录更新前的权重和缓冲区、送入 MinSR 的样本及其振幅、局域能量、重加权因子，以及求解器实际收到的 Gram 矩阵和右端。快照另存乘过步长的完整更新向量、按参数 dtype 舍入的有符号参数改变量，以及更新是否已应用。参数范数取更新前的可训练参数，更新范数取已乘步长并舍入的可训练参数改变量。整体振幅偏移另存，最大绝对局域能量的样本索引从 0 起算。
+
+出现阶段内相邻两步加权能量差的绝对值至少为 20、最大绝对局域能量至少为 10000、参数更新范数至少为 0.5、非有限值或求解异常时，`diagnostics/events/` 保留当步和最多 10 个前序训练快照。有限值事件继续训练。测量阶段记录每轮的加权能量和中心方差，更新相关字段留空。
+
+用事件快照复算同一批自旋。复算使用快照里的采样振幅作局域能量分母，并另外用同一权重重算这些振幅供比较。省略 `--device` 时沿用原运行设备。[快照复算入口](../examples_torch/replay_diagnostic.py)
+
+```bash
+.venv/bin/python -m examples_torch.replay_diagnostic /path/to/step_000123.pt
+```
+
 [history]: https://github.com/GhostArtyom/MinSR/blob/ba2f4f8383db31fab70a4adf03a6d66072453d0a/docs/pytorch-migration-plan.md#完整验收结果
 [acceptance-commit]: https://github.com/GhostArtyom/MinSR/commit/ba2f4f8383db31fab70a4adf03a6d66072453d0a
 [accepted-ordinary]: ../runs/j1j2_square_10x10_J1-1_J2-0.5/20261122_153201/training.log

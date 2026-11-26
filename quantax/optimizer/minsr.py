@@ -15,7 +15,7 @@ from ..nn import Sequential, filter_vjp
 from ..sampler import Samples
 from ..operator import Operator
 from ..utils import tree_fully_flatten, to_array_shard, array_extend
-from ..global_defs import get_default_dtype
+from ..global_defs import is_params_cpl
 
 
 def _memory_headroom(devices):
@@ -49,6 +49,7 @@ class MinSR(TDVP):
     derivative batch. Centering and the dense solve still use all samples.
     On a single GPU, symmetry-projected states can start with a batch
     estimated from available memory. A memory failure can lower the batch.
+    Gram construction and the solve use double precision.
     """
 
     def __init__(
@@ -68,6 +69,9 @@ class MinSR(TDVP):
         if self.vs_type == 1:
             raise ValueError("'MinSR' optimizer doesn't support vs_type 1")
 
+        complex_derivatives = (self.vs_type == 2 or is_params_cpl()
+                               or np.issubdtype(self.state.dtype, np.complexfloating))
+        self._derivative_dtype = np.dtype(np.complex128 if complex_derivatives else np.float64)
         if jacobian_batch is not None:
             jacobian_batch = index(jacobian_batch)
             if jacobian_batch < 1:
@@ -168,7 +172,7 @@ class MinSR(TDVP):
             gi, delta_imag = backward(layers, neuron, delta.imag)
             grad = gr + 1j * gi
             delta = delta_real + 1j * delta_imag if delta_real is not None else None
-        grad = jnp.sum(grad.astype(get_default_dtype()), axis=0)
+        grad = jnp.sum(grad.astype(self._derivative_dtype), axis=0)
         return grad, delta
 
     @eqx.filter_jit
@@ -237,6 +241,7 @@ class MinSR(TDVP):
     @partial(jax.jit, static_argnums=0, donate_argnums=1)
     def _get_Obar(self, Omat: jax.Array, reweight: jax.Array) -> jax.Array:
         # should be pmean here
+        reweight = reweight.astype(Omat.real.dtype)
         Omat -= jnp.mean(Omat, axis=0, keepdims=True)
         Omat *= jnp.sqrt(reweight[:, None] / Omat.shape[0])
         Omat = array_extend(Omat, jax.local_device_count(), axis=1)
@@ -256,10 +261,11 @@ class MinSR(TDVP):
         return Tmat, Omean, reweight
 
     def _gram_shape_dtype(self, nsamples):
-        dtype = np.dtype(get_default_dtype())
+        if not jax.config.x64_enabled:
+            raise ValueError("MinSR requires jax_enable_x64 for double-precision Gram computation.")
         if self.vs_type != 0:
             nsamples *= 2
-            dtype = np.dtype(jnp.float64 if dtype in (jnp.float64, jnp.complex128) else jnp.float32)
+        dtype = np.dtype(np.float64) if self.vs_type == 2 else self._derivative_dtype
         return (nsamples, nsamples), dtype
 
     def _initial_derivative_batch(self, nsamples, devices):
@@ -270,7 +276,7 @@ class MinSR(TDVP):
             return None
         available, limit = headroom
         (rows, cols), dtype = self._gram_shape_dtype(nsamples)
-        derivative_bytes = self.state.nparams * np.dtype(get_default_dtype()).itemsize
+        derivative_bytes = self.state.nparams * self._derivative_dtype.itemsize
         per_projected_sample = derivative_bytes * self.state.nsymm
         # Leave space for the dense Gram and eigensolver, retained derivatives,
         # centering temporaries, and other live GPU allocations.
@@ -364,9 +370,12 @@ class MinSR(TDVP):
         return step
 
     def solve(self, samples: Samples, Tmat: jax.Array, Ebar: jax.Array) -> jax.Array:
+        _, dtype = self._gram_shape_dtype(samples.nsamples)
+        if Tmat.dtype != dtype:
+            raise ValueError(f"MinSR Gram must be constructed in {dtype}, got {Tmat.dtype}.")
         if self.vs_type != 0:
             Ebar = jnp.concatenate([Ebar.real, Ebar.imag])
-        Tinv_E = self._solver(Tmat, Ebar)
+        Tinv_E = self._solver(Tmat, Ebar.astype(dtype))
         if isinstance(Tinv_E, tuple):
             Tinv_E, self._solver_info = Tinv_E
         step = self.Ohvp(samples, Tinv_E)
